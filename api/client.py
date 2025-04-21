@@ -178,16 +178,74 @@ def cancel_all_orders(api_key: str, secret_key: str, symbol: str) -> Dict:
     endpoint = f"/api/{API_VERSION}/orders"
     instruction = "orderCancelAll"
     params = {"symbol": symbol}
-    data = {"symbol": symbol}
-    return make_request("DELETE", endpoint, api_key, secret_key, instruction, params, data)
+    
+    # 构建签名消息
+    timestamp = str(int(time.time() * 1000))
+    window = DEFAULT_WINDOW
+    
+    query_string = f"symbol={symbol}"
+    sign_message = f"instruction={instruction}&{query_string}&timestamp={timestamp}&window={window}"
+    
+    signature = create_signature(secret_key, sign_message)
+    if not signature:
+        return {"error": "签名创建失败"}
+        
+    headers = {
+        'Content-Type': 'application/json',
+        'X-API-KEY': api_key,
+        'X-SIGNATURE': signature,
+        'X-TIMESTAMP': timestamp,
+        'X-WINDOW': str(window)
+    }
+    
+    url = f"{API_URL}{endpoint}"
+    try:
+        response = requests.delete(url, headers=headers, params=params)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"取消订单时发生HTTP错误: {e.response.text if hasattr(e, 'response') else str(e)}")
+        return {"error": f"取消订单失败: {str(e)}"}
+    except Exception as e:
+        logger.error(f"取消订单时发生错误: {str(e)}")
+        return {"error": f"取消订单失败: {str(e)}"}
 
 def cancel_order(api_key: str, secret_key: str, order_id: str, symbol: str) -> Dict:
     """取消指定订单"""
     endpoint = f"/api/{API_VERSION}/order"
     instruction = "orderCancel"
     params = {"orderId": order_id, "symbol": symbol}
-    data = {"orderId": order_id, "symbol": symbol}
-    return make_request("DELETE", endpoint, api_key, secret_key, instruction, params, data)
+    
+    # 构建签名消息
+    timestamp = str(int(time.time() * 1000))
+    window = DEFAULT_WINDOW
+    
+    query_string = f"orderId={order_id}&symbol={symbol}"
+    sign_message = f"instruction={instruction}&{query_string}&timestamp={timestamp}&window={window}"
+    
+    signature = create_signature(secret_key, sign_message)
+    if not signature:
+        return {"error": "签名创建失败"}
+        
+    headers = {
+        'Content-Type': 'application/json',
+        'X-API-KEY': api_key,
+        'X-SIGNATURE': signature,
+        'X-TIMESTAMP': timestamp,
+        'X-WINDOW': str(window)
+    }
+    
+    url = f"{API_URL}{endpoint}"
+    try:
+        response = requests.delete(url, headers=headers, params=params)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"取消订单时发生HTTP错误: {e.response.text if hasattr(e, 'response') else str(e)}")
+        return {"error": f"取消订单失败: {str(e)}"}
+    except Exception as e:
+        logger.error(f"取消订单时发生错误: {str(e)}")
+        return {"error": f"取消订单失败: {str(e)}"}
 
 def get_markets() -> Dict:
     """获取所有交易对信息"""
