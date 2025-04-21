@@ -10,6 +10,7 @@ load_dotenv()
 
 # API配置
 API_URL = "https://api.backpack.exchange"
+WS_URL = "wss://ws.backpack.exchange"
 API_VERSION = "v1"
 DEFAULT_WINDOW = "5000"
 
@@ -17,9 +18,11 @@ DEFAULT_WINDOW = "5000"
 SYMBOL = "SOL_USDC"  # 交易对
 ORDER_AMOUNT = 4  # 单次下单金额(USDC)，约为总资金的1/100
 GRID_TOTAL_INVESTMENT = 400  # 总投资额(USDC)，包含SOL和USDC的总价值
-PRICE_PRECISION = 4  # 价格精度
-QUANTITY_PRECISION = 4  # 数量精度
+PRICE_PRECISION = 2  # 价格精度
+QUANTITY_PRECISION = 2  # 数量精度
 SPREAD = 0.0015  # 挂单距离中间价的价差(0.15%)，约为手续费的2倍
+BASE_ORDER_SIZE = 0.02  # 基础订单大小(SOL)
+QUOTE_ORDER_SIZE = 4  # 基础订单大小(USDC)
 
 # 布林带参数
 LONG_BOLL_PERIOD = 60  # 长周期布林带(用于仓位控制)，1小时
@@ -40,8 +43,3 @@ SECRET_KEY = os.getenv("BACKPACK_SECRET_KEY", "")
 
 if not API_KEY or not SECRET_KEY:
     raise ValueError("请设置环境变量 BACKPACK_API_KEY 和 BACKPACK_SECRET_KEY")
-
-# 日志配置
-LOG_LEVEL = "INFO"
-LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-

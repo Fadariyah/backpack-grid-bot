@@ -1,28 +1,33 @@
 """
-API认证模块
+API認證和簽名相關模塊
 """
+import base64
+import nacl.signing
+import sys
+from typing import Optional
+from logger import setup_logger
 
-import hmac
-import hashlib
+logger = setup_logger("api.auth")
 
-def create_signature(secret_key: str, message: str) -> str:
+def create_signature(secret_key: str, message: str) -> Optional[str]:
     """
-    创建API请求签名
+    創建API簽名
     
     Args:
-        secret_key: API密钥
-        message: 待签名消息
+        secret_key: API密鑰
+        message: 要簽名的消息
         
     Returns:
-        str: 签名字符串
+        簽名字符串或None（如果簽名失敗）
     """
     try:
-        signature = hmac.new(
-            secret_key.encode('utf-8'),
-            message.encode('utf-8'),
-            hashlib.sha256
-        ).hexdigest()
-        return signature
+        # 嘗試對密鑰進行解碼和簽名
+        decoded_key = base64.b64decode(secret_key)
+        signing_key = nacl.signing.SigningKey(decoded_key)
+        signature = signing_key.sign(message.encode('utf-8')).signature
+        return base64.b64encode(signature).decode('utf-8')
     except Exception as e:
-        print(f"创建签名失败: {str(e)}")
+        logger.error(f"簽名創建失敗: {e}")
+        # logger.error("無法創建API簽名，程序將終止") # 注释掉日志
+        # sys.exit(1) # 移除 exit 调用
         return None
