@@ -5,19 +5,20 @@ API请求客户端模块
 import json
 import time
 import requests
-import hmac
-import hashlib
 from typing import Dict, Any, Optional, List, Union
 from decimal import Decimal
 from urllib.parse import urlencode
 from .auth import create_signature
-from config import API_URL, API_VERSION, DEFAULT_WINDOW
 from .ws_client import BackpackWSClient
+from config import API_URL, API_VERSION, DEFAULT_WINDOW
+from logger import setup_logger
+
+logger = setup_logger("api_client")
 
 # 全局WebSocket客户端实例
 ws_client: Optional[BackpackWSClient] = None
 
-def init_ws_client(api_key: str = "", secret_key: str = ""):
+def init_ws_client(api_key: str = "", secret_key: str = "") -> BackpackWSClient:
     """初始化WebSocket客户端"""
     global ws_client
     if ws_client is None:
@@ -51,14 +52,16 @@ def get_orderbook(symbol: str) -> Dict:
     except Exception as e:
         return {"error": f"请求订单簿时出错: {str(e)}"}
 
-def get_mid_price(symbol: str) -> Decimal:
+def get_mid_price(symbol: str) -> Optional[Decimal]:
     """获取中间价格"""
     global ws_client
     
     # 优先使用WebSocket数据
     if ws_client and ws_client.connected:
-        return Decimal(str(ws_client.get_mid_price()))
-        
+        mid_price = ws_client.get_mid_price()
+        if mid_price > 0:
+            return Decimal(str(mid_price))
+            
     # 否则使用订单簿数据计算
     orderbook = get_orderbook(symbol)
     if "error" in orderbook:

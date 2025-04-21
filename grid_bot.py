@@ -3,8 +3,9 @@
 """
 
 import time
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from decimal import Decimal
+import random
 
 from api.client import (
     execute_order,
@@ -63,36 +64,113 @@ class BollMakerBot:
         self.position_size, self.position_cost = self.db.get_position(self.symbol)
         logger.info(f"从数据库加载持仓信息 - 数量: {self.position_size}, 成本: {self.position_cost}")
         
+        # 初始化价格信息
+        self.bid_price = Decimal('0')
+        self.ask_price = Decimal('0')
+        self.last_price = Decimal('0')
+        
         # 初始化WebSocket客户端
         self.ws_client = init_ws_client(API_KEY, SECRET_KEY)
+        self.ws_client.on_message_callback = self._handle_ws_message
         self.ws_client.subscribe_orderbook(self.symbol)
+        self.ws_client.subscribe_bookticker(self.symbol)
         
-    def _get_mid_price(self) -> Decimal:
+    def _handle_ws_message(self, stream: str, data: dict):
+        """处理WebSocket消息"""
+        try:
+            if stream.startswith("bookTicker."):
+                if 'b' in data and 'a' in data:
+                    self.bid_price = Decimal(str(data['b']))
+                    self.ask_price = Decimal(str(data['a']))
+                    self.last_price = (self.bid_price + self.ask_price) / Decimal('2')
+            elif stream.startswith("depth."):
+                if 'b' in data and 'a' in data:
+                    # 可以处理深度数据，如果需要的话
+                    pass
+        except Exception as e:
+            logger.error(f"处理WebSocket消息时出错: {str(e)}")
+        
+    def _retry_with_backoff(self, func, max_retries: int = 3, initial_delay: float = 1.0) -> Optional[any]:
+        """
+        使用指数退避的重试机制
+        Args:
+            func: 要重试的函数
+            max_retries: 最大重试次数
+            initial_delay: 初始延迟时间(秒)
+        """
+        delay = initial_delay
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                result = func()
+                if result is not None:
+                    return result
+            except Exception as e:
+                last_error = e
+                logger.warning(f"第{attempt + 1}次尝试失败: {str(e)}")
+            
+            # 如果不是最后一次尝试，则等待后重试
+            if attempt < max_retries - 1:
+                # 添加随机抖动，避免多个实例同时重试
+                jitter = random.uniform(0, 0.1) * delay
+                sleep_time = delay + jitter
+                logger.info(f"等待 {sleep_time:.2f} 秒后重试...")
+                time.sleep(sleep_time)
+                delay *= 2  # 指数退避
+        
+        # 所有重试都失败
+        error_msg = f"重试{max_retries}次后仍然失败"
+        if last_error:
+            error_msg += f": {str(last_error)}"
+        logger.error(error_msg)
+        return None
+        
+    def _get_mid_price(self) -> Optional[Decimal]:
         """获取当前中间价格"""
-        mid_price = get_mid_price(self.symbol)
-        if not mid_price:
-            logger.error("获取中间价格失败")
+        if self.last_price > 0:
+            return self.last_price
+            
+        # 如果WebSocket未获取到价格，则通过REST API获取
+        def _get_price():
+            price = get_mid_price(self.symbol)
+            if price:
+                return Decimal(str(price))
+            return None
+            
+        mid_price = self._retry_with_backoff(_get_price)
+        if mid_price is None:
+            logger.error(f"获取{self.symbol}中间价格失败")
             return None
         return mid_price
         
-    def _check_balance(self) -> Tuple[Decimal, Decimal]:
+    def _check_balance(self) -> Tuple[Optional[Decimal], Optional[Decimal]]:
         """
         检查账户余额
         Returns:
             (base_available, quote_available): 可用base和quote资产数量
         """
-        # 获取现货余额
-        balance = get_balance(API_KEY, SECRET_KEY)
-        if "error" in balance:
-            logger.error(f"获取账户余额失败: {balance['error']}")
+        def _get_balances():
+            # 获取现货余额
+            balance = get_balance(API_KEY, SECRET_KEY)
+            if "error" in balance:
+                logger.error(f"获取账户余额失败: {balance['error']}")
+                return None
+                
+            # 获取借贷仓位
+            borrow_lend = get_borrow_lend_positions(API_KEY, SECRET_KEY)
+            if "error" in borrow_lend:
+                logger.error(f"获取借贷仓位失败: {borrow_lend['error']}")
+                return None
+                
+            return balance, borrow_lend
+            
+        result = self._retry_with_backoff(_get_balances)
+        if result is None:
             return None, None
             
-        # 获取借贷仓位
-        borrow_lend = get_borrow_lend_positions(API_KEY, SECRET_KEY)
-        if "error" in borrow_lend:
-            logger.error(f"获取借贷仓位失败: {borrow_lend['error']}")
-            return None, None
-            
+        balance, borrow_lend = result
+        
         # 计算base资产余额
         base_available = Decimal('0')
         base_borrowed = Decimal('0')
@@ -201,6 +279,11 @@ class BollMakerBot:
             "orderType": "LIMIT"
         }
         
+        def _execute_order_with_retry(order_params):
+            return self._retry_with_backoff(
+                lambda: execute_order(API_KEY, SECRET_KEY, order_params)
+            )
+        
         # 放置买单
         if not BUY_BELOW_SMA or price_float < long_middle:
             if quote_available >= quantity * buy_price:
@@ -208,12 +291,13 @@ class BollMakerBot:
                     "side": "BUY",
                     "price": str(buy_price)
                 })
-                result = execute_order(API_KEY, SECRET_KEY, order_details)
-                if "error" in result:
-                    logger.error(f"下买单失败 @ {buy_price}: {result['error']}")
-                else:
+                result = _execute_order_with_retry(order_details)
+                if result and "error" not in result:
                     logger.info(f"下买单成功 @ {buy_price}")
                     self._update_position_info(quantity, buy_price, True)
+                else:
+                    error_msg = result.get('error') if result else "未知错误"
+                    logger.error(f"下买单失败 @ {buy_price}: {error_msg}")
         
         # 放置卖单
         # 从数据库获取最新持仓成本
@@ -224,25 +308,39 @@ class BollMakerBot:
                     "side": "SELL",
                     "price": str(sell_price)
                 })
-                result = execute_order(API_KEY, SECRET_KEY, order_details)
-                if "error" in result:
-                    logger.error(f"下卖单失败 @ {sell_price}: {result['error']}")
-                else:
+                result = _execute_order_with_retry(order_details)
+                if result and "error" not in result:
                     logger.info(f"下卖单成功 @ {sell_price}")
                     self._update_position_info(quantity, sell_price, False)
+                else:
+                    error_msg = result.get('error') if result else "未知错误"
+                    logger.error(f"下卖单失败 @ {sell_price}: {error_msg}")
                     
     def _monitor_and_adjust(self):
         """监控和调整订单"""
+        consecutive_errors = 0
+        max_consecutive_errors = 5
+        
         while True:
             try:
                 # 获取中间价
                 mid_price = self._get_mid_price()
                 if not mid_price:
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_consecutive_errors:
+                        logger.error(f"连续{max_consecutive_errors}次获取价格失败，暂停交易1分钟")
+                        time.sleep(60)
+                        consecutive_errors = 0
                     continue
-                    
+                
+                consecutive_errors = 0  # 重置错误计数
+                
                 # 取消现有订单
-                cancel_result = cancel_all_orders(API_KEY, SECRET_KEY, self.symbol)
-                if "error" in cancel_result:
+                def _cancel_orders():
+                    return cancel_all_orders(API_KEY, SECRET_KEY, self.symbol)
+                
+                cancel_result = self._retry_with_backoff(_cancel_orders)
+                if cancel_result and "error" in cancel_result:
                     logger.error(f"取消订单失败: {cancel_result['error']}")
                     continue
                     
@@ -256,7 +354,13 @@ class BollMakerBot:
                 
             except Exception as e:
                 logger.error(f"监控过程发生错误: {str(e)}")
-                time.sleep(5)
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.error(f"连续{max_consecutive_errors}次发生错误，暂停交易1分钟")
+                    time.sleep(60)
+                    consecutive_errors = 0
+                else:
+                    time.sleep(5)
                 
     def start(self):
         """启动交易机器人"""
@@ -269,7 +373,9 @@ class BollMakerBot:
         self._monitor_and_adjust()
         
     def __del__(self):
-        """析构时关闭数据库连接"""
+        """析构时关闭连接"""
+        if hasattr(self, 'ws_client'):
+            self.ws_client.close()
         if hasattr(self, 'db'):
             self.db.close()
 
