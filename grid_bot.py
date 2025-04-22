@@ -67,7 +67,7 @@ class BollMakerBot:
         
         # 添加订单控制
         self.last_order_time = 0
-        self.order_interval = 60  # 60秒，即1分钟
+        self.order_interval = 120  # 120秒，即2分钟
         
         # 初始化API客户端
         self.rest_client = BackpackClient(self.api_key, self.secret_key)
@@ -104,35 +104,39 @@ class BollMakerBot:
                     data = msg.get('data')
 
                     if action == 'update_position':
-                        order_data = data
-                        size, cost = self.db.get_position(self.symbol)
-                        
-                        # 计算新的持仓
-                        order_size = Decimal(str(order_data['quantity']))
-                        order_price = Decimal(str(order_data['price']))
-                        
-                        if order_data['side'].lower() == 'buy':
-                            new_size = size + order_size
-                            new_cost = cost + (order_size * order_price)
-                        else:  # sell
-                            new_size = size - order_size
-                            new_cost = cost * (new_size / size) if size != 0 else Decimal('0')
-                        
-                        # 更新数据库
-                        self.db.update_position(self.symbol, new_size, new_cost)
-                        
-                        # 记录交易历史
-                        self.db.add_trade(
-                            self.symbol,
-                            order_data['side'],
-                            order_price,
-                            order_size
-                        )
-                        
-                        # 清除缓存
-                        with self.cache_lock:
-                            self.position_cache = None
+                        try:
+                            order_data = data
+                            logger.info(f"开始处理持仓更新: {order_data}")
                             
+                            size, cost = self.db.get_position(self.symbol)
+                            logger.info(f"当前持仓: size={size}, cost={cost}")
+                            
+                            # 计算新的持仓
+                            order_size = Decimal(str(order_data['quantity']))
+                            order_price = Decimal(str(order_data['price']))
+                            
+                            if order_data['side'].lower() == 'buy':
+                                new_size = size + order_size
+                                new_cost = cost + (order_size * order_price)
+                            else:  # sell
+                                new_size = size - order_size
+                                new_cost = cost * (new_size / size) if size != 0 else Decimal('0')
+                            
+                            # 更新数据库 - 转换为 float
+                            self.db.update_position(self.symbol, float(new_size), float(new_cost))
+                            logger.info(f"持仓更新成功: new_size={new_size}, new_cost={new_cost}")
+                            
+                            # 记录交易历史 - 转换为 float
+                            self.db.add_trade(
+                                self.symbol,
+                                order_data['side'],
+                                float(order_price),  # 转换为 float
+                                float(order_size)    # 转换为 float
+                            )
+                            logger.info("交易历史记录添加成功")
+                        except Exception as e:
+                            logger.error(f"处理持仓更新时发生错误: {e}")
+                            logger.exception("详细错误信息：")  # 添加详细的错误堆栈信息
                     elif action == 'get_position':
                         size, cost = self.db.get_position(self.symbol)
                         with self.cache_lock:

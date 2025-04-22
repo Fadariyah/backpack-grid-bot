@@ -113,13 +113,17 @@ class PositionDB:
         """, (symbol, size, cost, size, cost))
         self.conn.commit()
         
-    def add_trade(self, symbol: str, side: str, price: Decimal, quantity: Decimal):
-        """记录交易历史"""
+    def add_trade(self, symbol: str, side: str, price: float, size: float):
+        """添加交易记录"""
+        # 确保输入类型正确
+        price = float(price)
+        size = float(size)
+        
         cursor = self.conn.cursor()
         cursor.execute("""
         INSERT INTO trades (symbol, side, price, quantity)
         VALUES (?, ?, ?, ?)
-        """, (symbol, side, price, quantity))
+        """, (symbol, side, price, size))
         self.conn.commit()
         
         # 每添加新记录时检查是否需要清理

@@ -20,7 +20,7 @@ ORDER_AMOUNT = 4  # 单次下单金额(USDC)，约为总资金的1/100
 GRID_TOTAL_INVESTMENT = 400  # 总投资额(USDC)，包含SOL和USDC的总价值
 PRICE_PRECISION = 2  # 价格精度
 QUANTITY_PRECISION = 2  # 数量精度
-SPREAD = 0.0015  # 挂单距离中间价的价差(0.15%)，约为手续费的2倍
+SPREAD = 0.001  # 挂单距离中间价的价差(0.1%)
 BASE_ORDER_SIZE = 0.02  # 基础订单大小(SOL)
 QUOTE_ORDER_SIZE = 4  # 基础订单大小(USDC)
 
