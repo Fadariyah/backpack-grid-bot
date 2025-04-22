@@ -115,12 +115,25 @@ class BollMakerBot:
                             order_size = Decimal(str(order_data['quantity']))
                             order_price = Decimal(str(order_data['price']))
                             
-                            if order_data['side'].lower() == 'buy':
+                            # 修正：使用 'Bid' 而不是 'buy' 来判断买入
+                            if order_data['side'].upper() == 'BID':
                                 new_size = size + order_size
                                 new_cost = cost + (order_size * order_price)
-                            else:  # sell
+                                logger.info(f"买入更新: +{order_size} @ {order_price}")
+                            else:  # Ask
                                 new_size = size - order_size
-                                new_cost = cost * (new_size / size) if size != 0 else Decimal('0')
+                                # 修正：卖出时的成本计算
+                                if size > 0:
+                                    # 按比例减少成本
+                                    cost_reduction = (order_size / size) * cost
+                                    new_cost = cost - cost_reduction
+                                else:
+                                    new_cost = Decimal('0')
+                                logger.info(f"卖出更新: -{order_size} @ {order_price}")
+                            
+                            # 确保数值不会出现负数
+                            new_size = max(Decimal('0'), new_size)
+                            new_cost = max(Decimal('0'), new_cost)
                             
                             # 更新数据库 - 转换为 float
                             self.db.update_position(self.symbol, float(new_size), float(new_cost))
@@ -451,34 +464,87 @@ class BollMakerBot:
     def _initialize_websocket(self):
         """等待WebSocket连接建立并进行初始化订阅"""
         wait_time = 0
-        max_wait_time = 10
-        while not self.ws_client.connected and wait_time < max_wait_time:
-            time.sleep(0.5)
-            wait_time += 0.5
-            
-        if self.ws_client.connected:
-            logger.info("WebSocket连接已建立，初始化数据流...")
-            
-            # 初始化订单簿
-            orderbook_initialized = self.ws_client.initialize_orderbook()
-            
-            # 订阅深度流和行情数据
-            if orderbook_initialized:
-                depth_subscribed = self.ws_client.subscribe_depth()
-                ticker_subscribed = self.ws_client.subscribe_bookTicker()
-                
-                if depth_subscribed and ticker_subscribed:
-                    logger.info("行情数据流订阅成功!")
+        max_wait_time = 30  # 增加等待时间到30秒
+        retry_count = 0
+        max_retries = 3
+        
+        while retry_count < max_retries:
+            try:
+                wait_time = 0
+                while not self.ws_client.connected and wait_time < max_wait_time:
+                    time.sleep(1)
+                    wait_time += 1
                     
-                # 订阅私有订单更新流
-                if self.subscribe_order_updates():
-                    logger.info("订单更新流订阅成功!")
-                else:
-                    logger.error("订单更新流订阅失败")
-            else:
-                logger.error("订单簿初始化失败")
-        else:
-            logger.warning("WebSocket连接建立超时，将在运行过程中继续尝试连接")
+                if self.ws_client.connected:
+                    logger.info("WebSocket连接已建立，初始化数据流...")
+                    
+                    # 初始化订单簿
+                    orderbook_initialized = self.ws_client.initialize_orderbook()
+                    
+                    # 订阅深度流和行情数据
+                    if orderbook_initialized:
+                        depth_subscribed = self.ws_client.subscribe_depth()
+                        ticker_subscribed = self.ws_client.subscribe_bookTicker()
+                        
+                        if depth_subscribed and ticker_subscribed:
+                            logger.info("行情数据流订阅成功!")
+                            
+                        # 订阅私有订单更新流
+                        if self.subscribe_order_updates():
+                            logger.info("订单更新流订阅成功!")
+                            return True  # 所有初始化成功
+                        else:
+                            logger.error("订单更新流订阅失败")
+                    else:
+                        logger.error("订单簿初始化失败")
+                
+                retry_count += 1
+                if retry_count < max_retries:
+                    logger.warning(f"WebSocket初始化失败，正在进行第{retry_count + 1}次重试...")
+                    self.ws_client.reconnect()
+                    time.sleep(5)  # 重试前等待5秒
+                    
+            except Exception as e:
+                logger.error(f"WebSocket初始化发生错误: {str(e)}")
+                retry_count += 1
+                if retry_count < max_retries:
+                    time.sleep(5)
+                    
+        logger.error(f"在{max_retries}次尝试后WebSocket初始化仍然失败")
+        return False
+
+    def _check_and_reconnect_ws(self):
+        """检查WebSocket连接状态并在需要时重连"""
+        if not self.ws_client.connected:
+            logger.warning("检测到WebSocket连接断开，尝试重新连接...")
+            retry_count = 0
+            max_retries = 3
+            
+            while retry_count < max_retries and not self.ws_client.connected:
+                try:
+                    self.ws_client.reconnect()
+                    time.sleep(2)  # 等待连接建立
+                    
+                    if self.ws_client.connected:
+                        success = self._initialize_websocket()
+                        if success:
+                            logger.info("WebSocket重连成功并完成初始化")
+                            return True
+                            
+                except Exception as e:
+                    logger.error(f"WebSocket重连尝试失败: {str(e)}")
+                    
+                retry_count += 1
+                if retry_count < max_retries:
+                    wait_time = 5 * (retry_count + 1)  # 递增等待时间
+                    logger.info(f"等待{wait_time}秒后进行第{retry_count + 1}次重试...")
+                    time.sleep(wait_time)
+            
+            if not self.ws_client.connected:
+                logger.error("WebSocket重连失败，将在下一个检查周期重试")
+                return False
+                
+        return True
 
     def start(self):
         """启动交易机器人"""
@@ -487,25 +553,32 @@ class BollMakerBot:
             
             # 连接WebSocket并初始化数据流
             self.ws_client.connect()
-            self._initialize_websocket()
-            
-            if not self.ws_client.connected:
-                logger.error("WebSocket连接失败，无法启动机器人")
+            if not self._initialize_websocket():
+                logger.error("WebSocket初始化失败，无法启动机器人")
                 self.stop()
                 return
             
             logger.info("交易机器人已启动")
             
+            last_ws_check = time.time()
+            ws_check_interval = 30  # 每30秒检查一次WebSocket状态
+            
             # 主循环
             while self.running:
                 try:
+                    current_time = time.time()
+                    
                     # 处理数据库操作队列
                     self._process_db_queue()
                     
-                    # 检查WebSocket连接状态
-                    if not self.ws_client.connected:
-                        logger.warning("WebSocket连接断开，尝试重新连接...")
-                        self.ws_client.reconnect()
+                    # 定期检查WebSocket连接状态
+                    if current_time - last_ws_check >= ws_check_interval:
+                        if not self._check_and_reconnect_ws():
+                            # 如果重连失败，增加检查间隔以避免过于频繁的重试
+                            ws_check_interval = min(ws_check_interval * 2, 300)  # 最大间隔5分钟
+                        else:
+                            ws_check_interval = 30  # 重置为正常间隔
+                        last_ws_check = current_time
                     
                     time.sleep(0.1)  # 控制循环频率
                     
