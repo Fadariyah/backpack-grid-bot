@@ -18,6 +18,7 @@ class BollingerBands:
         self.period = period
         self.num_std = num_std
         self.prices: List[float] = []
+        self._last_bands: Tuple[float, float, float] = (0, 0, 0)
         
     def update(self, price: float) -> Tuple[float, float, float]:
         """
@@ -37,7 +38,8 @@ class BollingerBands:
             
         # 至少需要一个完整周期才能计算
         if len(self.prices) < self.period:
-            return price, price, price
+            self._last_bands = (price, price, price)
+            return self._last_bands
             
         # 计算布林带
         prices_array = np.array(self.prices)
@@ -47,7 +49,35 @@ class BollingerBands:
         upper = middle + self.num_std * std
         lower = middle - self.num_std * std
         
-        return upper, middle, lower
+        self._last_bands = (upper, middle, lower)
+        return self._last_bands
+        
+    def get_bands(self) -> Tuple[float, float, float]:
+        """
+        获取最新的布林带值
+        
+        Returns:
+            (upper, middle, lower): 上轨、中轨、下轨
+        """
+        return self._last_bands
+        
+    def get_sma(self) -> float:
+        """
+        获取最新的移动平均值
+        
+        Returns:
+            float: 移动平均值（中轨）
+        """
+        return self._last_bands[1]
+        
+    def is_ready(self) -> bool:
+        """
+        检查是否有足够的数据来计算布林带
+        
+        Returns:
+            bool: 如果有足够的数据返回True，否则返回False
+        """
+        return len(self.prices) >= self.period
         
     def get_position_scale(self, price: float, upper: float, lower: float, 
                           max_scale: float = 100.0, min_scale: float = 1.0) -> float:

@@ -10,6 +10,7 @@ import threading
 import logging
 import queue
 import os
+from datetime import datetime
 
 from api.backpack_client import BackpackClient
 from api.backpack_ws_client import BackpackWSClient
@@ -32,7 +33,18 @@ from config import (
     TRADE_IN_BAND,
     BUY_BELOW_SMA,
     BASE_ORDER_SIZE,
-    QUOTE_ORDER_SIZE
+    QUOTE_ORDER_SIZE,
+    LONG_BOLL_INTERVAL,
+    SHORT_BOLL_INTERVAL,
+    DYNAMIC_SPREAD,
+    SPREAD_MIN,
+    SPREAD_MAX,
+    TREND_SKEW,
+    UPTREND_SKEW,
+    DOWNTREND_SKEW,
+    STOP_LOSS_ACTIVATION,
+    STOP_LOSS_RATIO,
+    TAKE_PROFIT_RATIO
 )
 from utils.indicators import BollingerBands
 from utils.database import PositionDB
@@ -78,20 +90,77 @@ class BollMakerBot:
             on_message_callback=self._handle_ws_message
         )
         
-        # 初始化Bollinger Bands指标
-        self.long_boll = BollingerBands(
-            period=config["LONG_BOLL_PERIOD"],
-            num_std=config["LONG_BOLL_STD"]
-        )
-        self.short_boll = BollingerBands(
-            period=config["SHORT_BOLL_PERIOD"],
-            num_std=config["SHORT_BOLL_STD"]
-        )
+        # 只保留必要的锁
+        self.boll_lock = threading.Lock()  # 布林带数据锁
+        
+        # 添加初始化完成事件
+        self.init_complete = threading.Event()
+        
+        # K线更新控制
+        self.kline_update_thread = None
+        self.kline_update_interval = 60  # 每60秒更新一次K线数据
         
         # 初始化状态变量
         self.running = False
         self.current_orders = {}
         self.last_price = 0
+        self.last_update_time = 0
+        
+        # 初始化布林带数据
+        self.long_boll = BollingerBands(period=LONG_BOLL_PERIOD, num_std=LONG_BOLL_STD)
+        self.short_boll = BollingerBands(period=SHORT_BOLL_PERIOD, num_std=SHORT_BOLL_STD)
+        self.long_klines = {}
+        self.short_klines = {}
+
+    def setup_boll_data(self, prices: List[float], long_period: int = None, short_period: int = None):
+        """
+        为测试目的设置布林带数据
+        
+        Args:
+            prices: 价格列表
+            long_period: 长期布林带周期（可选）
+            short_period: 短期布林带周期（可选）
+        """
+        if long_period:
+            self.long_boll = BollingerBands(period=long_period, num_std=LONG_BOLL_STD)
+        if short_period:
+            self.short_boll = BollingerBands(period=short_period, num_std=SHORT_BOLL_STD)
+            
+        # 生成模拟的K线数据
+        current_time = int(time.time())
+        for i, price in enumerate(prices):
+            timestamp = current_time - (len(prices) - i) * 60  # 每分钟一个K线
+            kline_data = {
+                "close": price,
+                "timestamp": timestamp
+            }
+            
+            # 更新长期和短期K线数据
+            self.long_klines[timestamp] = kline_data
+            self.short_klines[timestamp] = kline_data
+            
+        # 计算布林带
+        with self.boll_lock:
+            # 按时间戳排序
+            sorted_long_klines = sorted(self.long_klines.values(), key=lambda x: x["timestamp"])
+            sorted_short_klines = sorted(self.short_klines.values(), key=lambda x: x["timestamp"])
+            
+            # 获取收盘价
+            long_closes = [float(k["close"]) for k in sorted_long_klines[-self.long_boll.period:]]
+            short_closes = [float(k["close"]) for k in sorted_short_klines[-self.short_boll.period:]]
+            
+            # 更新布林带
+            if len(long_closes) >= self.long_boll.period:
+                for price in long_closes:
+                    self.long_boll.update(price)
+            if len(short_closes) >= self.short_boll.period:
+                for price in short_closes:
+                    self.short_boll.update(price)
+                
+        # 更新最新价格
+        if prices:
+            self.last_price = prices[-1]
+            self.last_update_time = current_time
 
     def _process_db_queue(self):
         """处理数据库操作队列"""
@@ -207,22 +276,20 @@ class BollMakerBot:
                     bid_price = float(event_data['b'])
                     ask_price = float(event_data['a'])
                     current_price = (bid_price + ask_price) / 2
-                    
-                    # 更新价格
-                    self.last_price = current_price
-                    
-                    # 更新Bollinger Bands
-                    self.long_boll.update(current_price)
-                    self.short_boll.update(current_price)
-                    
-                    # 检查是否需要调整订单（每分钟一次）
                     current_time = time.time()
+                    
+                    # 直接更新价格（不需要锁，允许竞争）
+                    self.last_price = current_price
+                    self.last_update_time = current_time
+                    
+                    # 检查是否需要调整订单
                     if current_time - self.last_order_time >= self.order_interval:
-                        # 使用缓存的持仓信息
+                        if not self.init_complete.is_set():
+                            logger.debug("等待K线数据初始化完成...")
+                            return
+                            
                         position = self._get_cached_position()
                         position_cost = position["avg_price"] if position else 0
-                        
-                        # 检查是否需要调整订单
                         self._adjust_orders(current_price, position_cost)
                         self.last_order_time = current_time
                     
@@ -265,12 +332,130 @@ class BollMakerBot:
                 logger.error(f"监控价格失败: {str(e)}")
                 time.sleep(5)  # 发生错误时等待一段时间再继续
 
+    def _calculate_dynamic_spread(self, current_price):
+        """
+        计算动态价差
+        :param current_price: 当前价格
+        :return: (ask_spread, bid_spread) 卖出价差和买入价差
+        """
+        try:
+            if not self.config["DYNAMIC_SPREAD"]:
+                return self.config["SPREAD"], self.config["SPREAD"]
+
+            # 获取布林带数据
+            short_upper, _, short_lower = self.short_boll.get_bands()
+            
+            # 计算波动率（使用布林带范围相对于当前价格的比例）
+            volatility = abs(short_upper - short_lower) / current_price
+
+            # 记录波动率用于调试
+            self.logger.debug(f"波动率计算 - 上轨: {short_upper}, 下轨: {short_lower}, " +
+                          f"当前价格: {current_price}, 波动率: {volatility:.4%}")
+
+            # 根据波动率计算基础价差
+            if volatility <= 0.0025:  # 低波动率 (0.25%)
+                base_spread = self.config["SPREAD_MIN"]
+            elif volatility >= 0.05:  # 高波动率 (5%)
+                base_spread = self.config["SPREAD_MAX"]
+            else:
+                # 在中间范围内线性插值
+                spread_range = self.config["SPREAD_MAX"] - self.config["SPREAD_MIN"]
+                normalized_vol = (volatility - 0.0025) / (0.05 - 0.0025)
+                base_spread = self.config["SPREAD_MIN"] + spread_range * normalized_vol
+
+            # 应用趋势偏移
+            if self.config["TREND_SKEW"]:
+                sma = self.short_boll.get_sma()
+                if current_price > sma:  # 上升趋势
+                    # 在上升趋势中，降低卖出价差使其更容易成交，同时提高买入价差以控制风险
+                    # 使用(2-SKEW)确保买卖价差的总和保持不变，只是分配比例发生变化
+                    ask_spread = base_spread * self.config["UPTREND_SKEW"]  # UPTREND_SKEW < 1，降低卖出价差
+                    bid_spread = base_spread * (2 - self.config["UPTREND_SKEW"])  # 相应提高买入价差
+                else:  # 下降趋势
+                    # 在下降趋势中，提高卖出价差以控制风险，同时降低买入价差使其更容易成交
+                    ask_spread = base_spread * self.config["DOWNTREND_SKEW"]  # DOWNTREND_SKEW > 1，提高卖出价差
+                    bid_spread = base_spread * (2 - self.config["DOWNTREND_SKEW"])  # 相应降低买入价差
+            else:
+                ask_spread = bid_spread = base_spread
+
+            # 确保价差在配置的范围内
+            ask_spread = max(min(ask_spread, self.config["SPREAD_MAX"]), self.config["SPREAD_MIN"])
+            bid_spread = max(min(bid_spread, self.config["SPREAD_MAX"]), self.config["SPREAD_MIN"])
+
+            # 记录最终价差用于调试
+            self.logger.debug(f"价差计算 - 基础价差: {base_spread:.4f}, " +
+                          f"最终卖出价差: {ask_spread:.4f}, 买入价差: {bid_spread:.4f}")
+
+            return ask_spread, bid_spread
+
+        except Exception as e:
+            self.logger.error(f"计算动态价差失败: {str(e)}")
+            return self.config["SPREAD"], self.config["SPREAD"]
+
+    def _check_risk_control(self, current_price: float, position_cost: float) -> bool:
+        """检查风控条件"""
+        try:
+            if position_cost <= 0:
+                return True
+            
+            # 计算当前收益率
+            roi = (current_price - position_cost) / position_cost
+            
+            # 检查止损条件
+            if abs(roi) >= self.config["STOP_LOSS_ACTIVATION"]:
+                if roi < 0 and abs(roi) >= self.config["STOP_LOSS_RATIO"]:
+                    logger.warning(f"触发止损: ROI={roi:.2%}, 当前价格={current_price}, 持仓成本={position_cost}")
+                    # 市价卖出止损
+                    self._close_position()
+                    return False
+            
+            # 检查止盈条件
+            if roi >= self.config["TAKE_PROFIT_RATIO"]:
+                logger.info(f"触发止盈: ROI={roi:.2%}, 当前价格={current_price}, 持仓成本={position_cost}")
+                # 市价卖出止盈
+                self._close_position()
+                return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"检查风控条件失败: {str(e)}")
+            return True
+
+    def _close_position(self):
+        """市价平仓"""
+        try:
+            position = self._get_cached_position()
+            if position and position["size"] > 0:
+                order_details = {
+                    "symbol": self.symbol,
+                    "side": "Ask",
+                    "orderType": "Market",
+                    "quantity": str(position["size"]),
+                    "timeInForce": "IOC"
+                }
+                order = self.rest_client.place_order(order_details)
+                if order and "id" in order:
+                    logger.info(f"市价平仓成功: 数量={position['size']}")
+                
+        except Exception as e:
+            logger.error(f"市价平仓失败: {str(e)}")
+
     def _adjust_orders(self, current_price: float, position_cost: float):
         """根据当前价格和持仓成本调整订单"""
         try:
-            # 获取Bollinger Bands数据
-            long_upper, long_middle, long_lower = self.long_boll.update(current_price)
-            short_upper, short_middle, short_lower = self.short_boll.update(current_price)
+            # 检查风控条件
+            if not self._check_risk_control(current_price, position_cost):
+                return
+            
+            # 获取布林带数据的副本（最小化锁的持有时间）
+            with self.boll_lock:
+                long_bands = self.long_boll.get_bands()
+                short_bands = self.short_boll.get_bands()
+            
+            # 使用数据副本进行计算（不需要锁）
+            long_upper, long_middle, long_lower = long_bands
+            short_upper, short_middle, short_lower = short_bands
             
             # 计算目标持仓比例
             position_scale = self._calculate_position_scale(
@@ -283,40 +468,27 @@ class BollMakerBot:
             self.rest_client.cancel_all_orders(self.symbol)
             self.current_orders = {}
             
-            # 检查是否可以下单
-            base_balance, quote_balance, total_value, error = self._calculate_total_balance()
-            if error:
-                logger.error(f"获取余额失败: {error}")
-                return
-            if base_balance <= 0 or quote_balance <= 0:
-                logger.warning("余额不足，跳过下单")
-                return
-                
+            # 计算动态价差
+            ask_spread, bid_spread = self._calculate_dynamic_spread(current_price)
+            
             # 计算买卖价格
-            spread = self.config["GRID_SPREAD"]
-            price_precision = self.config["PRICE_PRECISION"]
-            
-            # 先格式化当前价格，避免后续计算产生过多小数位
-            current_price = round(current_price, price_precision)
-            
-            # 计算买卖价格并立即控制精度
-            buy_price = round(current_price * (1 - spread), price_precision)
-            sell_price = round(current_price * (1 + spread), price_precision)
+            buy_price = round(current_price * (1 - bid_spread), self.config["PRICE_PRECISION"])
+            sell_price = round(current_price * (1 + ask_spread), self.config["PRICE_PRECISION"])
             
             # 检查是否满足交易条件
             can_buy = True
             can_sell = True
             
             if self.config["TRADE_IN_BAND"]:
-                can_buy = current_price > short_lower
-                can_sell = current_price < short_upper
+                can_buy = self.short_boll.is_price_in_band(current_price, short_upper, short_lower)
+                can_sell = self.short_boll.is_price_in_band(current_price, short_upper, short_lower)
                 
             if self.config["BUY_BELOW_SMA"]:
                 can_buy = can_buy and current_price < short_middle
                 
             # 检查最小利润
             if position_cost > 0:
-                min_sell_price = round(position_cost * (1 + self.config["MIN_PROFIT_SPREAD"]), price_precision)
+                min_sell_price = round(position_cost * (1 + self.config["MIN_PROFIT_SPREAD"]), self.config["PRICE_PRECISION"])
                 can_sell = can_sell and sell_price > min_sell_price
                 
             # 计算订单数量
@@ -384,7 +556,7 @@ class BollMakerBot:
                                 short_upper: float, short_lower: float) -> float:
         """计算目标持仓比例"""
         try:
-            # 检查布林带是否初始化完成
+            # 不需要加锁，因为使用的是数据副本
             if not all([long_upper, long_lower, short_upper, short_lower]):
                 logger.warning("布林带数据未完全初始化，返回中性仓位")
                 return 1.0
@@ -407,6 +579,10 @@ class BollMakerBot:
             long_position = max(0.0, min(1.0, long_position))
             short_position = max(0.0, min(1.0, short_position))
             
+            # 反转位置值（价格越低，仓位越大）
+            long_position = 1.0 - long_position
+            short_position = 1.0 - short_position
+            
             # 综合长期和短期指标
             position_scale = (long_position + short_position) / 2
             
@@ -421,7 +597,7 @@ class BollMakerBot:
                       f"短期位置: {short_position:.4f}, 最终比例: {position_scale:.4f}")
             
             return position_scale
-            
+                
         except Exception as e:
             logger.error(f"计算持仓比例失败: {str(e)}")
             return 1.0  # 发生错误时返回中性仓位
@@ -460,6 +636,137 @@ class BollMakerBot:
         else:
             logger.info(f"已经订阅了订单更新: {stream}")
             return True
+
+    def _update_kline_data(self):
+        """更新K线数据并计算布林带"""
+        try:
+            # 获取K线数据（不需要锁）
+            long_klines = self.rest_client.get_klines(
+                self.symbol,
+                interval=self.config["LONG_BOLL_INTERVAL"],
+                limit=self.config["LONG_BOLL_PERIOD"] * 2
+            )
+            
+            short_klines = self.rest_client.get_klines(
+                self.symbol,
+                interval=self.config["SHORT_BOLL_INTERVAL"],
+                limit=self.config["SHORT_BOLL_PERIOD"] * 2
+            )
+            
+            # 检查K线数据
+            if not long_klines or not short_klines:
+                logger.error(f"获取K线数据失败 - 长周期: {len(long_klines) if long_klines else 0} 根, " +
+                           f"短周期: {len(short_klines) if short_klines else 0} 根")
+                return
+                
+            # 记录原始数据格式以便调试
+            logger.debug(f"长周期K线数据格式: {type(long_klines)}, 数据: {long_klines[:1]}")
+            logger.debug(f"短周期K线数据格式: {type(short_klines)}, 数据: {short_klines[:1]}")
+                
+            # 准备数据（不需要锁）
+            if long_klines:
+                try:
+                    # 确保数据是列表格式
+                    if isinstance(long_klines, dict):
+                        long_klines = [long_klines]
+                    
+                    # 按开始时间排序
+                    sorted_long_klines = sorted(long_klines, key=lambda x: x['start'] if isinstance(x, dict) else x[0])
+                    recent_long_klines = sorted_long_klines[-self.config["LONG_BOLL_PERIOD"]:]
+                    
+                    # 获取收盘价
+                    long_closes = []
+                    for k in recent_long_klines:
+                        if isinstance(k, dict):
+                            long_closes.append(float(k['close']))
+                        else:
+                            long_closes.append(float(k[4]))  # 第4个元素是收盘价
+                    
+                    # 更新长周期布林带
+                    with self.boll_lock:
+                        self.long_boll = BollingerBands(
+                            period=self.config["LONG_BOLL_PERIOD"],
+                            num_std=self.config["LONG_BOLL_STD"]
+                        )
+                        for price in long_closes:
+                            self.long_boll.update(price)
+                        
+                    logger.debug(f"更新长周期布林带 - 使用 {len(long_closes)} 根K线")
+                except Exception as e:
+                    logger.error(f"处理长周期K线数据时出错: {str(e)}")
+            
+            if short_klines:
+                try:
+                    # 确保数据是列表格式
+                    if isinstance(short_klines, dict):
+                        short_klines = [short_klines]
+                    
+                    # 按开始时间排序
+                    sorted_short_klines = sorted(short_klines, key=lambda x: x['start'] if isinstance(x, dict) else x[0])
+                    recent_short_klines = sorted_short_klines[-self.config["SHORT_BOLL_PERIOD"]:]
+                    
+                    # 获取收盘价
+                    short_closes = []
+                    for k in recent_short_klines:
+                        if isinstance(k, dict):
+                            short_closes.append(float(k['close']))
+                        else:
+                            short_closes.append(float(k[4]))  # 第4个元素是收盘价
+                    
+                    # 更新短周期布林带
+                    with self.boll_lock:
+                        self.short_boll = BollingerBands(
+                            period=self.config["SHORT_BOLL_PERIOD"],
+                            num_std=self.config["SHORT_BOLL_STD"]
+                        )
+                        for price in short_closes:
+                            self.short_boll.update(price)
+                        
+                    logger.debug(f"更新短周期布林带 - 使用 {len(short_closes)} 根K线")
+                except Exception as e:
+                    logger.error(f"处理短周期K线数据时出错: {str(e)}")
+            
+            # 更新最新价格（不需要锁，允许竞争）
+            if short_klines and len(short_klines) > 0:
+                latest_kline = short_klines[-1]
+                try:
+                    if isinstance(latest_kline, dict):
+                        # 将时间字符串转换为时间戳
+                        latest_time = datetime.strptime(latest_kline['end'], '%Y-%m-%d %H:%M:%S').timestamp()
+                        latest_price = float(latest_kline['close'])
+                    else:
+                        latest_time = float(latest_kline[0])
+                        latest_price = float(latest_kline[4])
+                        
+                    if latest_time > self.last_update_time:
+                        self.last_price = latest_price
+                        self.last_update_time = latest_time
+                        logger.debug(f"从K线更新最新价格: {self.last_price}")
+                except Exception as e:
+                    logger.error(f"更新最新价格时出错: {str(e)}")
+                    if not isinstance(e, str):
+                        import traceback
+                        logger.error(f"详细错误信息: {traceback.format_exc()}")
+            
+            # 标记初始化完成
+            if not self.init_complete.is_set():
+                # 使用 is_ready 方法检查布林带是否准备就绪
+                with self.boll_lock:
+                    long_ready = self.long_boll.is_ready()
+                    short_ready = self.short_boll.is_ready()
+                
+                if long_ready and short_ready:
+                    self.init_complete.set()
+                    logger.info("K线数据初始化完成")
+                else:
+                    logger.debug(f"布林带数据尚未准备就绪 - 长周期: {len(self.long_boll.prices)}/{self.config['LONG_BOLL_PERIOD']}, " +
+                               f"短周期: {len(self.short_boll.prices)}/{self.config['SHORT_BOLL_PERIOD']}")
+                
+        except Exception as e:
+            logger.error(f"更新K线数据失败: {str(e)}")
+            if not isinstance(e, str):
+                import traceback
+                logger.error(f"详细错误信息: {traceback.format_exc()}")
 
     def _initialize_websocket(self):
         """等待WebSocket连接建立并进行初始化订阅"""
@@ -546,6 +853,17 @@ class BollMakerBot:
                 
         return True
 
+    def _kline_update_worker(self):
+        """K线数据更新工作线程"""
+        logger.info("K线更新线程已启动")
+        while self.running:
+            try:
+                self._update_kline_data()
+                time.sleep(self.kline_update_interval)
+            except Exception as e:
+                logger.error(f"K线更新线程发生错误: {str(e)}")
+                time.sleep(5)  # 发生错误时等待较短时间后继续
+
     def start(self):
         """启动交易机器人"""
         try:
@@ -555,6 +873,19 @@ class BollMakerBot:
             self.ws_client.connect()
             if not self._initialize_websocket():
                 logger.error("WebSocket初始化失败，无法启动机器人")
+                self.stop()
+                return
+            
+            # 启动K线更新线程
+            self.kline_update_thread = threading.Thread(
+                target=self._kline_update_worker,
+                daemon=True
+            )
+            self.kline_update_thread.start()
+            
+            # 等待初始化完成
+            if not self.init_complete.wait(timeout=30):
+                logger.error("K线数据初始化超时")
                 self.stop()
                 return
             
@@ -598,6 +929,13 @@ class BollMakerBot:
         """停止交易机器人"""
         try:
             self.running = False
+            
+            # 等待K线更新线程结束
+            if self.kline_update_thread and self.kline_update_thread.is_alive():
+                try:
+                    self.kline_update_thread.join(timeout=5)
+                except Exception as e:
+                    logger.error(f"等待K线更新线程结束时发生错误: {str(e)}")
             
             # 取消所有订单
             self.rest_client.cancel_all_orders(self.symbol)
@@ -739,7 +1077,18 @@ if __name__ == "__main__":
         "TRADE_IN_BAND": TRADE_IN_BAND,
         "BUY_BELOW_SMA": BUY_BELOW_SMA,
         "BASE_ORDER_SIZE": BASE_ORDER_SIZE,
-        "QUOTE_ORDER_SIZE": QUOTE_ORDER_SIZE
+        "QUOTE_ORDER_SIZE": QUOTE_ORDER_SIZE,
+        "LONG_BOLL_INTERVAL": LONG_BOLL_INTERVAL,
+        "SHORT_BOLL_INTERVAL": SHORT_BOLL_INTERVAL,
+        "DYNAMIC_SPREAD": DYNAMIC_SPREAD,
+        "SPREAD_MIN": SPREAD_MIN,
+        "SPREAD_MAX": SPREAD_MAX,
+        "TREND_SKEW": TREND_SKEW,
+        "UPTREND_SKEW": UPTREND_SKEW,
+        "DOWNTREND_SKEW": DOWNTREND_SKEW,
+        "STOP_LOSS_ACTIVATION": STOP_LOSS_ACTIVATION,
+        "STOP_LOSS_RATIO": STOP_LOSS_RATIO,
+        "TAKE_PROFIT_RATIO": TAKE_PROFIT_RATIO
     }
     
     bot = None

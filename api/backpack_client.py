@@ -247,22 +247,80 @@ class BackpackClient:
             params["symbol"] = symbol
         return self.make_request("GET", endpoint, instruction, params)
 
-    def get_klines(self, symbol: str, interval: str = "1h", limit: int = 100) -> Dict:
+    def get_klines(self, symbol: str, interval: str = "1h", limit: int = 100) -> List:
         """
         获取K线数据
         
         Args:
             symbol: 交易对
             interval: 时间间隔 (1m,3m,5m,15m,30m,1h,2h,4h,6h,8h,12h,1d,3d,1w,1month)
-            limit: 获取数量
+            limit: 获取数量，默认500，最大1000
+            
+        Returns:
+            List: K线数据列表，每个元素包含：
+            [
+                timestamp,  # 开盘时间（秒）
+                open,      # 开盘价
+                high,     # 最高价
+                low,      # 最低价
+                close,    # 收盘价
+                volume,   # 成交量
+                closeTime # 收盘时间（秒）
+            ]
         """
         endpoint = f"/api/{API_VERSION}/klines"
+        
+        # 计算开始时间（当前时间减去 limit 个 interval 的时间）
+        interval_seconds = {
+            "1m": 60,
+            "3m": 180,
+            "5m": 300,
+            "15m": 900,
+            "30m": 1800,
+            "1h": 3600,
+            "2h": 7200,
+            "4h": 14400,
+            "6h": 21600,
+            "8h": 28800,
+            "12h": 43200,
+            "1d": 86400,
+            "3d": 259200,
+            "1w": 604800,
+            "1month": 2592000
+        }
+        
+        # 获取间隔的秒数
+        if interval not in interval_seconds:
+            logger.error(f"不支持的时间间隔: {interval}")
+            return []
+            
+        interval_secs = interval_seconds[interval]
+        
+        # 获取当前时间戳（秒）并向下取整到整分钟
+        current_time = int(time.time())
+        current_time = current_time - (current_time % 60)
+        
+        # 计算开始时间
+        total_seconds = interval_secs * (limit + 1)  # 多获取一个周期的数据
+        start_time = current_time - total_seconds
+        
+        logger.debug(f"获取K线数据 - 交易对: {symbol}, 间隔: {interval}, 数量: {limit}")
+        logger.debug(f"时间范围 - 开始: {start_time} ({time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))})")
+        
         params = {
             "symbol": symbol,
             "interval": interval,
-            "limit": str(limit)
+            "limit": str(limit),
+            "startTime": str(start_time)
         }
-        return self.make_request("GET", endpoint, params=params)
+        
+        response = self.make_request("GET", endpoint, params=params)
+        
+        if isinstance(response, dict) and "error" in response:
+            logger.error(f"获取K线数据失败: {response['error']}")
+            return []
+            
+        return response if isinstance(response, list) else []
 
     def get_borrow_lend_positions(self) -> Dict:
         """获取借贷仓位信息"""

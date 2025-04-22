@@ -5,11 +5,12 @@
 ## 策略特点
 
 - 双重布林带控制
-  - 长周期布林带用于仓位管理
-  - 短周期布林带用于趋势判断
+  - 长周期布林带用于仓位管理（默认1小时）
+  - 短周期布林带用于趋势判断（默认30分钟）
 - 动态仓位管理
   - 价格越低，买入仓位越大
   - 价格越高，买入仓位越小
+  - 基于布林带位置动态调整订单大小
 - 趋势适应
   - 可选择只在均线下方买入
   - 设置最小获利价差，避免过早卖出
@@ -18,6 +19,7 @@
   - 实时跟踪持仓成本
   - 动态调整仓位大小
   - 支持借贷仓位管理
+  - 订单大小限制保护
 
 ## 安装要求
 
@@ -25,7 +27,8 @@
 - 依赖包：
   - requests
   - numpy
-  - python-dotenv（可选，用于管理环境变量）
+  - python-dotenv（用于管理环境变量）
+  - sqlite3（用于本地数据存储）
 
 ## 快速开始
 
@@ -37,38 +40,54 @@ cd backpack-grid
 
 2. 安装依赖：
 ```bash
-pip install -r requirements.txt
+uv sync
+```
+如果未安装uv，请先安装uv：
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 3. 配置API密钥：
-   - 打开 `config.py`
-   - 填入您的 Backpack API密钥和密钥
+   - 创建 `.env` 文件
+   - 填入您的 Backpack API密钥：
+     ```
+     BACKPACK_API_KEY=您的API密钥
+     BACKPACK_SECRET_KEY=您的密钥
+     ```
 
 4. 配置策略参数：
    - 在 `config.py` 中设置：
      ```python
      # 交易配置
      SYMBOL = "SOL_USDC"  # 交易对
-     GRID_NUM = 10  # 网格数量
-     GRID_TOTAL_INVESTMENT = 1000  # 总投资额(USDC)
+     ORDER_AMOUNT = 4  # 单次下单金额(USDC)
+     GRID_TOTAL_INVESTMENT = 400  # 总投资额(USDC)
      
      # 布林带参数
-     LONG_BOLL_PERIOD = 30  # 长周期布林带(用于仓位控制)
+     LONG_BOLL_PERIOD = 21  # 长周期布林带(1小时)
      LONG_BOLL_STD = 2.0  # 长周期标准差倍数
-     SHORT_BOLL_PERIOD = 5  # 短周期布林带(用于趋势判断)
+     SHORT_BOLL_PERIOD = 21  # 短周期布林带(5分钟)
      SHORT_BOLL_STD = 2.0  # 短周期标准差倍数
      
      # 仓位控制
-     MAX_POSITION_SCALE = 100.0  # 最大仓位倍数
+     MAX_POSITION_SCALE = 10.0  # 最大仓位倍数
      MIN_POSITION_SCALE = 1.0  # 最小仓位倍数
-     MIN_PROFIT_SPREAD = 0.01  # 最小获利价差(1%)
+     MIN_PROFIT_SPREAD = 0.001  # 最小获利价差(0.1%)
      TRADE_IN_BAND = True  # 是否只在布林带内交易
      BUY_BELOW_SMA = True  # 是否只在均线下方买入
+     
+     # 订单精度
+     PRICE_PRECISION = 2  # 价格精度
+     QUANTITY_PRECISION = 2  # 数量精度
+     
+     # 订单大小
+     BASE_ORDER_SIZE = 0.02  # 基础订单大小(SOL)
+     QUOTE_ORDER_SIZE = 4  # 基础订单大小(USDC)
      ```
 
 5. 运行策略：
 ```bash
-python grid_bot.py
+uv run grid_bot.py
 ```
 
 ## 参数说明
@@ -77,53 +96,67 @@ python grid_bot.py
 
 1. 长周期布林带 (`LONG_BOLL_PERIOD`, `LONG_BOLL_STD`)
    - 用于控制仓位大小
-   - 周期越长，仓位调整越平缓
-   - 标准差倍数影响布林带宽度
+   - 21根K线，1小时周期，适合中长期趋势判断
+   - 标准差倍数2.0，可根据市场波动调整
 
 2. 短周期布林带 (`SHORT_BOLL_PERIOD`, `SHORT_BOLL_STD`)
-   - 用于判断短期趋势
+   - 用于判断短期趋势和交易机会
+   - 21根K线，5分钟周期，适合短期市场波动捕捉
+   - 使用相同的窗口大小(21)，保持指标的一致性
    - 当价格超出短期布林带时暂停交易
-   - 帮助避免在强趋势中频繁交易
 
 ### 仓位控制参数
 
 1. 仓位倍数 (`MAX_POSITION_SCALE`, `MIN_POSITION_SCALE`)
    - 控制在不同价格位置的买入数量
-   - 价格越低，买入倍数越接近 MAX_POSITION_SCALE
-   - 价格越高，买入倍数越接近 MIN_POSITION_SCALE
+   - 最大持仓为基础订单的10倍，降低风险
+   - 最小持仓为基础订单大小，保持市场活跃度
 
 2. 获利控制 (`MIN_PROFIT_SPREAD`)
-   - 最小获利价差，例如 0.01 表示1%
-   - 只有当价格超过持仓成本+价差时才会卖出
-   - 避免频繁小额交易
+   - 最小获利价差，设为0.1%
+   - 在保证盈利的同时提高成交概率
+   - 避免过大的价差影响做市效率
 
 3. 交易控制 (`TRADE_IN_BAND`, `BUY_BELOW_SMA`)
-   - TRADE_IN_BAND: 是否只在布林带内交易
-   - BUY_BELOW_SMA: 是否只在均线下方买入
-   - 用于控制交易时机，降低风险
+   - TRADE_IN_BAND: 只在布林带内交易，降低风险
+   - BUY_BELOW_SMA: 只在均线下方买入，避免追高
+
+4. 订单控制
+   - BASE_ORDER_SIZE: 基础订单大小（基础货币）
+   - QUOTE_ORDER_SIZE: 基础订单大小（计价货币）
+   - 订单大小会根据仓位倍数动态调整，但不超过基础大小的5倍
 
 ## 策略逻辑
 
 1. 仓位计算
-   - 使用长周期布林带将价格标准化到[-1, 1]区间
-   - 将标准化后的价格映射到[MAX_SCALE, MIN_SCALE]
-   - 据此动态调整每次交易的数量
+   - 结合长短期布林带位置计算目标仓位
+   - 动态调整订单大小，最大不超过基础订单的5倍
+   - 考虑当前持仓成本进行买卖决策
 
 2. 交易条件
    - 买入条件：
      * 价格在短期布林带内（如启用）
      * 价格在长期均线下方（如启用）
-     * 有足够的quote资产
+     * 有足够的计价货币余额
    - 卖出条件：
-     * 持有仓位 > 0
-     * 当前价格 > 持仓成本 * (1 + MIN_PROFIT_SPREAD)
-     * 有足够的base资产
+     * 价格高于持仓成本加最小获利价差
+     * 价格在布林带范围内（如启用）
+     * 有足够的基础货币余额
 
 3. 风险控制
    - 实时跟踪持仓成本和数量
-   - 动态调整买卖数量
+   - 订单大小限制保护
    - 在强趋势中自动暂停交易
    - 考虑借贷仓位进行余额计算
+
+## 数据存储
+
+策略使用SQLite数据库存储：
+- 持仓信息
+- 交易历史
+- 成本计算
+
+数据库文件位于 `data/positions.db`
 
 ## 适用场景
 
@@ -146,42 +179,6 @@ python grid_bot.py
 - 注意控制风险，合理设置参数
 - 市场有风险，投资需谨慎
 
-## 进阶使用
-
-1. 参数优化
-   - 可以通过回测优化布林带参数
-   - 根据交易对特性调整仓位倍数
-   - 根据手续费调整最小获利价差
-
-2. 风险管理
-   - 设置最大持仓限制
-   - 设置单次交易限制
-   - 设置止损条件
-
-## 贡献指南
-
-欢迎提交 Issue 和 Pull Request 来帮助改进这个项目。
-
 ## 许可证
 
 MIT License
-
-## 环境变量设置
-
-在运行机器人之前，请先设置以下环境变量：
-
-```bash
-# Linux/Mac
-export BACKPACK_API_KEY="您的API密钥"
-export BACKPACK_SECRET_KEY="您的密钥"
-
-# Windows (CMD)
-set BACKPACK_API_KEY=您的API密钥
-set BACKPACK_SECRET_KEY=您的密钥
-
-# Windows (PowerShell)
-$env:BACKPACK_API_KEY="您的API密钥"
-$env:BACKPACK_SECRET_KEY="您的密钥"
-```
-
-## 其他配置说明
