@@ -37,7 +37,7 @@
 ## เริ่มต้นอย่างรวดเร็ว
 1) โคลนโปรเจ็กต์
 ```bash
-git clone https://github.com/defi-maker/backpack-grid.git
+git clone https://github.com/Fadariyah/backpack-grid-bot.git
 cd backpack-grid
 ```
 
