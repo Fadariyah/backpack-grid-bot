@@ -182,19 +182,19 @@ class BackpackWSClient:
                     self.reconnect()
     
     def on_pong(self, ws, message):
-        """處理pong響應"""
+        """Handling pong responses"""
         self.last_heartbeat = time.time()
         
     def reconnect(self):
-        """完全断开并重新建立WebSocket连接"""
+        """Completely disconnect and reestablish the WebSocket connection"""
         with self.ws_lock:
             # 检查是否需要重连
             if not self.running:
-                logger.info("系统已停止运行，不进行重连")
+                logger.info("No reconnection needed, client is stopped")
                 return False
                 
             if self.reconnect_attempts >= self.max_reconnect_attempts:
-                logger.error(f"重连次数超过上限 ({self.max_reconnect_attempts})，停止重连")
+                logger.error(f"The number of reconnections exceeds the upper limit ({self.max_reconnect_attempts})，Stop reconnecting")
                 self.running = False  # 停止系统
                 return False
             
@@ -435,10 +435,10 @@ class BackpackWSClient:
                     self.on_message_callback(stream, event_data)
             
         except Exception as e:
-            logger.error(f"處理WebSocket消息時出錯: {e}")
+            logger.error(f"Error processing WebSocket message: {e}")
     
     def _update_orderbook(self, data):
-        """更新訂單簿（優化處理速度）"""
+        """Update order book (optimize processing speed)"""
         # 處理買單更新
         if 'b' in data:
             for bid in data['b']:
@@ -489,15 +489,15 @@ class BackpackWSClient:
                         self.orderbook["asks"] = sorted(self.orderbook["asks"], key=lambda x: x[0])
     
     def on_error(self, ws, error):
-        """處理WebSocket錯誤"""
-        logger.error(f"WebSocket發生錯誤: {error}")
+        """Handling WebSocket Errors"""
+        logger.error(f"WebSocket error: {error}")
         self.last_heartbeat = 0  # 強制觸發重連
     
     def on_close(self, ws, close_status_code, close_msg):
-        """處理WebSocket關閉"""
+        """Handling WebSocket Closure"""
         previous_connected = self.connected
         self.connected = False
-        logger.info(f"WebSocket連接已關閉: {close_msg if close_msg else 'No message'} (狀態碼: {close_status_code if close_status_code else 'None'})")
+        logger.info(f"WebSocket connection closed: {close_msg if close_msg else 'No message'} (Status Code: {close_status_code if close_status_code else 'None'})")
         
         # 清理當前socket資源
         if hasattr(ws, 'sock') and ws.sock:
@@ -505,29 +505,29 @@ class BackpackWSClient:
                 ws.sock.close()
                 ws.sock = None
             except Exception as e:
-                logger.debug(f"關閉socket時出錯: {e}")
+                logger.debug(f"Error closing socket: {e}")
         
         # 判断是否需要重连
         if close_status_code == 1000 or getattr(ws, '_closed_by_me', False):
-            logger.info("WebSocket正常关闭，不进行重连")
+            logger.info("WebSocket is closed normally without reconnection")
         elif previous_connected and self.running and self.auto_reconnect:
-            logger.info("WebSocket非正常关闭，准备重连")
+            logger.info("WebSocket closed abnormally, preparing to reconnect")
             # 使用新线程进行重连
             threading.Thread(target=self._safe_reconnect, daemon=True).start()
             
     def _safe_reconnect(self):
-        """安全的重连包装器"""
+        """safe reconnect"""
         try:
             time.sleep(1)  # 等待旧连接完全关闭
             if self.running and self.auto_reconnect:
                 self.reconnect()
         except Exception as e:
-            logger.error(f"安全重连过程中发生错误: {e}")
+            logger.error(f"An error occurred during secure reconnection: {e}")
     
     def close(self):
-        """完全關閉WebSocket連接"""
+        """WebSocket connection closed"""
         with self.ws_lock:
-            logger.info("主動關閉WebSocket連接...")
+            logger.info("closing the WebSocket connection...")
             self.running = False
             self.connected = False
             
@@ -555,7 +555,7 @@ class BackpackWSClient:
                     if hasattr(self.ws, 'sock') and self.ws.sock:
                         self.ws.sock.close()
                 except Exception as e:
-                    logger.error(f"關閉WebSocket時出錯: {e}")
+                    logger.error(f"Error closing WebSocket: {e}")
                 
                 # 等待完全關閉
                 time.sleep(0.5)
@@ -569,25 +569,25 @@ class BackpackWSClient:
                     pass
             self.ws_thread = None
             
-            # 重置訂閲狀態
+            # รีเซ็ตสถานะการสมัครสมาชิก
             self.subscriptions = []
             
-            logger.info("WebSocket連接已完全關閉")
+            logger.info("WebSocket Disconnected.")
     
     def get_current_price(self):
-        """獲取當前價格"""
+        """รับราคาปัจจุบัน"""
         return self.last_price
     
     def get_bid_ask(self):
-        """獲取買賣價"""
+        """รับราคาซื้อ"""
         return self.bid_price, self.ask_price
     
     def get_orderbook(self):
-        """獲取訂單簿"""
+        """รับสมุดคำสั่งซื้อขาย"""
         return self.orderbook
 
     def is_connected(self):
-        """檢查連接狀態"""
+        """ตรวจสอบสถานะการเชื่อมต่อ WebSocket"""
         if not self.connected:
             return False
         if not self.ws:
@@ -602,7 +602,7 @@ class BackpackWSClient:
             return False
     
     def get_liquidity_profile(self, depth_percentage=0.01):
-        """分析市場流動性特徵"""
+        """วิเคราะห์ลักษณะสภาพคล่องของตลาด"""
         if not self.orderbook["bids"] or not self.orderbook["asks"]:
             return None
         

@@ -1,5 +1,5 @@
 """
-布林带做市策略主模块
+โมดูลหลักสำหรับกลยุทธ์ทำตลาดด้วย Bollinger Band
 """
 
 import time
@@ -44,7 +44,10 @@ from config import (
     DOWNTREND_SKEW,
     STOP_LOSS_ACTIVATION,
     STOP_LOSS_RATIO,
-    TAKE_PROFIT_RATIO
+    TAKE_PROFIT_RATIO,
+    GRID_LEVELS_PER_SIDE,
+    GRID_STEP,
+    GRID_SIDE_BUDGET_RATIO,
 )
 from utils.indicators import BollingerBands
 from utils.database import PositionDB
@@ -54,22 +57,22 @@ logger = setup_logger("grid_bot")
 
 class BollMakerBot:
     def __init__(self, config: dict):
-        """初始化网格交易机器人"""
+        """เริ่มต้นหุ่นยนต์ทำตลาดแบบกริด/Bollinger"""
         self.config = config
         self.api_key = config["API_KEY"]
         self.secret_key = config["SECRET_KEY"]
         self.symbol = config["SYMBOL"]
         
-        # 确保data目录存在
+        # สร้างโฟลเดอร์ data หากยังไม่มี
         data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
         os.makedirs(data_dir, exist_ok=True)
         
-        # 初始化数据库
+        # เริ่มต้นฐานข้อมูล
         db_path = os.path.join(data_dir, "positions.db")
         self.db = PositionDB(db_path)
         self.logger = logging.getLogger(__name__)
         
-        # 初始化消息队列和事件
+        # ตั้งค่าคิวและอีเวนต์สำหรับงานฐานข้อมูล
         self.db_queue = queue.Queue()
         self.position_event = threading.Event()
         self.position_cache = None
@@ -77,11 +80,11 @@ class BollMakerBot:
         self.position_update_interval = 1
         self.cache_lock = threading.Lock()
         
-        # 添加订单控制
+        # การควบคุมการส่งออเดอร์ (rate-limit ของฝั่งเราเอง)
         self.last_order_time = 0
-        self.order_interval = 120  # 120秒，即2分钟
+        self.order_interval = 120  # 120 วินาที (2 นาที)
         
-        # 初始化API客户端
+        # เริ่มต้น REST/WS API client
         self.rest_client = BackpackClient(self.api_key, self.secret_key)
         self.ws_client = BackpackWSClient(
             self.api_key, 
@@ -90,23 +93,23 @@ class BollMakerBot:
             on_message_callback=self._handle_ws_message
         )
         
-        # 只保留必要的锁
-        self.boll_lock = threading.Lock()  # 布林带数据锁
+        # ใช้เฉพาะล็อกที่จำเป็น
+        self.boll_lock = threading.Lock()  # ล็อกสำหรับข้อมูล Bollinger
         
-        # 添加初始化完成事件
+        # อีเวนต์บ่งชี้ว่าเริ่มต้นข้อมูลครบแล้ว
         self.init_complete = threading.Event()
         
-        # K线更新控制
+        # การอัปเดต Kline
         self.kline_update_thread = None
-        self.kline_update_interval = 60  # 每60秒更新一次K线数据
+        self.kline_update_interval = 60  # อัปเดตทุก 60 วินาที
         
-        # 初始化状态变量
+        # สถานะภายใน
         self.running = False
         self.current_orders = {}
         self.last_price = 0
         self.last_update_time = 0
         
-        # 初始化布林带数据
+        # ตั้งค่า Bollinger เริ่มต้น
         self.long_boll = BollingerBands(period=LONG_BOLL_PERIOD, num_std=LONG_BOLL_STD)
         self.short_boll = BollingerBands(period=SHORT_BOLL_PERIOD, num_std=SHORT_BOLL_STD)
         self.long_klines = {}
@@ -114,42 +117,42 @@ class BollMakerBot:
 
     def setup_boll_data(self, prices: List[float], long_period: int = None, short_period: int = None):
         """
-        为测试目的设置布林带数据
+        ตั้งค่าข้อมูล Bollinger เพื่อการทดสอบ
         
         Args:
-            prices: 价格列表
-            long_period: 长期布林带周期（可选）
-            short_period: 短期布林带周期（可选）
+            prices: รายการราคา
+            long_period: คาบของ Bollinger ระยะยาว (ถ้ามี)
+            short_period: คาบของ Bollinger ระยะสั้น (ถ้ามี)
         """
         if long_period:
             self.long_boll = BollingerBands(period=long_period, num_std=LONG_BOLL_STD)
         if short_period:
             self.short_boll = BollingerBands(period=short_period, num_std=SHORT_BOLL_STD)
             
-        # 生成模拟的K线数据
+        # สร้างข้อมูล Kline จำลอง
         current_time = int(time.time())
         for i, price in enumerate(prices):
-            timestamp = current_time - (len(prices) - i) * 60  # 每分钟一个K线
+            timestamp = current_time - (len(prices) - i) * 60  # 1 แท่ง/นาที
             kline_data = {
                 "close": price,
                 "timestamp": timestamp
             }
             
-            # 更新长期和短期K线数据
+            # อัปเดตข้อมูล Kline ระยะยาว/สั้น
             self.long_klines[timestamp] = kline_data
             self.short_klines[timestamp] = kline_data
             
-        # 计算布林带
+        # คำนวณ Bollinger
         with self.boll_lock:
-            # 按时间戳排序
+            # เรียงตามเวลา
             sorted_long_klines = sorted(self.long_klines.values(), key=lambda x: x["timestamp"])
             sorted_short_klines = sorted(self.short_klines.values(), key=lambda x: x["timestamp"])
             
-            # 获取收盘价
+            # ดึงราคาปิด
             long_closes = [float(k["close"]) for k in sorted_long_klines[-self.long_boll.period:]]
             short_closes = [float(k["close"]) for k in sorted_short_klines[-self.short_boll.period:]]
             
-            # 更新布林带
+            # อัปเดต Bollinger
             if len(long_closes) >= self.long_boll.period:
                 for price in long_closes:
                     self.long_boll.update(price)
@@ -157,17 +160,17 @@ class BollMakerBot:
                 for price in short_closes:
                     self.short_boll.update(price)
                 
-        # 更新最新价格
+        # อัปเดตราคาล่าสุด
         if prices:
             self.last_price = prices[-1]
             self.last_update_time = current_time
 
     def _process_db_queue(self):
-        """处理数据库操作队列"""
+        """ประมวลผลงานในคิวฐานข้อมูล"""
         try:
             while True:
                 try:
-                    # 非阻塞方式获取消息
+                    # ดึงข้อความแบบไม่บล็อก
                     msg = self.db_queue.get_nowait()
                     action = msg.get('action')
                     data = msg.get('data')
@@ -175,50 +178,49 @@ class BollMakerBot:
                     if action == 'update_position':
                         try:
                             order_data = data
-                            logger.info(f"开始处理持仓更新: {order_data}")
+                            logger.info(f"เริ่มอัปเดตสถานะถือครอง: {order_data}")
                             
                             size, cost = self.db.get_position(self.symbol)
-                            logger.info(f"当前持仓: size={size}, cost={cost}")
+                            logger.info(f"สถานะถือครองปัจจุบัน: size={size}, cost={cost}")
                             
-                            # 计算新的持仓
+                            # คำนวณสถานะใหม่
                             order_size = Decimal(str(order_data['quantity']))
                             order_price = Decimal(str(order_data['price']))
                             
-                            # 修正：使用 'Bid' 而不是 'buy' 来判断买入
+                            # ใช้ 'Bid' เพื่อบ่งชี้ฝั่งซื้อ
                             if order_data['side'].upper() == 'BID':
                                 new_size = size + order_size
                                 new_cost = cost + (order_size * order_price)
-                                logger.info(f"买入更新: +{order_size} @ {order_price}")
+                                logger.info(f"อัปเดตซื้อ: +{order_size} @ {order_price}")
                             else:  # Ask
                                 new_size = size - order_size
-                                # 修正：卖出时的成本计算
+                                # ปรับต้นทุนเมื่อขายออก
                                 if size > 0:
-                                    # 按比例减少成本
                                     cost_reduction = (order_size / size) * cost
                                     new_cost = cost - cost_reduction
                                 else:
                                     new_cost = Decimal('0')
-                                logger.info(f"卖出更新: -{order_size} @ {order_price}")
+                                logger.info(f"อัปเดตขาย: -{order_size} @ {order_price}")
                             
-                            # 确保数值不会出现负数
+                            # ป้องกันค่าติดลบ
                             new_size = max(Decimal('0'), new_size)
                             new_cost = max(Decimal('0'), new_cost)
                             
-                            # 更新数据库 - 转换为 float
+                            # อัปเดตฐานข้อมูล (แปลงเป็น float)
                             self.db.update_position(self.symbol, float(new_size), float(new_cost))
-                            logger.info(f"持仓更新成功: new_size={new_size}, new_cost={new_cost}")
+                            logger.info(f"อัปเดตสถานะสำเร็จ: new_size={new_size}, new_cost={new_cost}")
                             
-                            # 记录交易历史 - 转换为 float
+                            # บันทึกประวัติการเทรด
                             self.db.add_trade(
                                 self.symbol,
                                 order_data['side'],
-                                float(order_price),  # 转换为 float
-                                float(order_size)    # 转换为 float
+                                float(order_price),
+                                float(order_size)
                             )
-                            logger.info("交易历史记录添加成功")
+                            logger.info("บันทึกประวัติการเทรดสำเร็จ")
                         except Exception as e:
-                            logger.error(f"处理持仓更新时发生错误: {e}")
-                            logger.exception("详细错误信息：")  # 添加详细的错误堆栈信息
+                            logger.error(f"เกิดข้อผิดพลาดระหว่างอัปเดตสถานะถือครอง: {e}")
+                            logger.exception("รายละเอียดข้อผิดพลาด:")
                     elif action == 'get_position':
                         size, cost = self.db.get_position(self.symbol)
                         with self.cache_lock:
@@ -233,44 +235,43 @@ class BollMakerBot:
                     break
                     
         except Exception as e:
-            self.logger.error(f"处理数据库队列时发生错误: {e}")
+            self.logger.error(f"เกิดข้อผิดพลาดระหว่างประมวลผลคิวฐานข้อมูล: {e}")
             if action == 'get_position':
-                self.position_event.set()  # 确保在错误情况下也设置事件
+                self.position_event.set()  # ให้แน่ใจว่าเซตอีเวนต์แม้เกิดข้อผิดพลาด
 
     def _get_cached_position(self):
-        """获取缓存的持仓信息"""
+        """ดึงสถานะถือครองจากแคช"""
         current_time = time.time()
         if self.position_cache is None or current_time - self.last_position_update > self.position_update_interval:
-            # 重置事件
+            # รีเซ็ตอีเวนต์
             self.position_event.clear()
             
-            # 请求更新持仓信息
+            # ขอให้อัปเดตสถานะถือครอง
             self.db_queue.put({
                 'action': 'get_position',
                 'data': None
             })
             
-            # 等待更新完成
-            self.position_event.wait(timeout=1.0)  # 设置超时以防止死锁
+            # รอการอัปเดต
+            self.position_event.wait(timeout=1.0)
             
         return self.position_cache or {'size': 0, 'avg_price': 0}
 
     def update_position(self, order_data: dict):
-        """更新持仓信息"""
+        """อัปเดตสถานะถือครอง (เพิ่มงานลงคิว)"""
         try:
-            # 将更新操作放入队列
             self.db_queue.put({
                 'action': 'update_position',
                 'data': order_data
             })
         except Exception as e:
-            self.logger.error(f"添加更新持仓任务失败: {e}")
+            self.logger.error(f"ไม่สามารถเพิ่มงานอัปเดตสถานะถือครองได้: {e}")
             raise
 
     def _handle_ws_message(self, stream, event_data):
-        """处理WebSocket消息回调"""
+        """จัดการข้อความที่ได้รับจาก WebSocket"""
         try:
-            # 处理行情数据
+            # ข้อมูลราคาท็อปออฟบุ๊ก
             if stream.startswith("bookTicker."):
                 if 'b' in event_data and 'a' in event_data:
                     bid_price = float(event_data['b'])
@@ -278,14 +279,14 @@ class BollMakerBot:
                     current_price = (bid_price + ask_price) / 2
                     current_time = time.time()
                     
-                    # 直接更新价格（不需要锁，允许竞争）
+                    # อัปเดตราคา (ไม่ล็อก ปล่อยให้มีการแข่งขันได้)
                     self.last_price = current_price
                     self.last_update_time = current_time
                     
-                    # 检查是否需要调整订单
+                    # พิจารณาปรับคำสั่งตามช่วงเวลา
                     if current_time - self.last_order_time >= self.order_interval:
                         if not self.init_complete.is_set():
-                            logger.debug("等待K线数据初始化完成...")
+                            logger.debug("รอให้ข้อมูล Kline พร้อมก่อน...")
                             return
                             
                         position = self._get_cached_position()
@@ -293,24 +294,24 @@ class BollMakerBot:
                         self._adjust_orders(current_price, position_cost)
                         self.last_order_time = current_time
                     
-            # 处理深度数据
+            # ข้อมูล depth
             elif stream.startswith("depth."):
                 if 'b' in event_data and 'a' in event_data:
-                    # 这里可以添加处理深度数据的逻辑
+                    # สามารถเติมตรรกะการใช้ depth ได้ที่นี่
                     pass
                     
-            # 处理订单更新
+            # การอัปเดตสถานะคำสั่ง
             elif stream.startswith("account.orderUpdate."):
                 event_type = event_data.get('e')
                 
-                # 处理订单成交事件
+                # อีเวนต์คำสั่งถูกเติมเต็มบางส่วน/ทั้งหมด
                 if event_type == 'orderFill':
                     order_id = event_data.get('i')
                     side = event_data.get('S')
                     quantity = float(event_data.get('l', '0'))
                     price = float(event_data.get('p', '0'))
                     
-                    # 更新持仓信息
+                    # อัปเดตสถานะถือครอง
                     order_data = {
                         'side': side,
                         'quantity': quantity,
@@ -319,111 +320,113 @@ class BollMakerBot:
                     self.update_position(order_data)
                     
         except Exception as e:
-            self.logger.error(f"处理WebSocket消息失败: {str(e)}")
+            self.logger.error(f"จัดการข้อความ WebSocket ล้มเหลว: {str(e)}")
 
     def _monitor_price(self):
-        """监控价格变化"""
+        """เฝ้าติดตามการเปลี่ยนแปลงของราคา"""
         while self.running:
             try:
-                # 定期更新持仓缓存
+                # อัปเดตแคชสถานะถือครองเป็นระยะ
                 self._get_cached_position()
                 time.sleep(1)
             except Exception as e:
-                logger.error(f"监控价格失败: {str(e)}")
-                time.sleep(5)  # 发生错误时等待一段时间再继续
+                logger.error(f"การเฝ้าติดตามราคาเกิดข้อผิดพลาด: {str(e)}")
+                time.sleep(5)
 
     def _calculate_dynamic_spread(self, current_price):
         """
-        计算动态价差
-        :param current_price: 当前价格
-        :return: (ask_spread, bid_spread) 卖出价差和买入价差
+        คำนวณสเปรดแบบไดนามิก
+        :param current_price: ราคาปัจจุบัน
+        :return: (ask_spread, bid_spread)
         """
         try:
             if not self.config["DYNAMIC_SPREAD"]:
                 return self.config["SPREAD"], self.config["SPREAD"]
 
-            # 获取布林带数据
+            # ดึง Bollinger ระยะสั้น
             short_upper, _, short_lower = self.short_boll.get_bands()
             
-            # 计算波动率（使用布林带范围相对于当前价格的比例）
+            # ใช้ความกว้างของแบนด์เทียบกับราคาเป็นตัวแทนความผันผวน
             volatility = abs(short_upper - short_lower) / current_price
 
-            # 记录波动率用于调试
-            self.logger.debug(f"波动率计算 - 上轨: {short_upper}, 下轨: {short_lower}, " +
-                          f"当前价格: {current_price}, 波动率: {volatility:.4%}")
+            # บันทึกเพื่อดีบัก
+            self.logger.debug(
+                f"คำนวณความผันผวน - บน: {short_upper}, ล่าง: {short_lower}, "
+                + f"ราคา: {current_price}, ผันผวน: {volatility:.4%}"
+            )
 
-            # 根据波动率计算基础价差
-            if volatility <= 0.0025:  # 低波动率 (0.25%)
+            # กำหนด base spread ตามระดับความผันผวน
+            if volatility <= 0.0025:  # ผันผวนต่ำ (0.25%)
                 base_spread = self.config["SPREAD_MIN"]
-            elif volatility >= 0.05:  # 高波动率 (5%)
+            elif volatility >= 0.05:  # ผันผวนสูง (5%)
                 base_spread = self.config["SPREAD_MAX"]
             else:
-                # 在中间范围内线性插值
+                # เชิงเส้นระหว่างช่วง
                 spread_range = self.config["SPREAD_MAX"] - self.config["SPREAD_MIN"]
                 normalized_vol = (volatility - 0.0025) / (0.05 - 0.0025)
                 base_spread = self.config["SPREAD_MIN"] + spread_range * normalized_vol
 
-            # 应用趋势偏移
+            # ปรับตามแนวโน้ม
             if self.config["TREND_SKEW"]:
                 sma = self.short_boll.get_sma()
-                if current_price > sma:  # 上升趋势
-                    # 在上升趋势中，降低卖出价差使其更容易成交，同时提高买入价差以控制风险
-                    # 使用(2-SKEW)确保买卖价差的总和保持不变，只是分配比例发生变化
-                    ask_spread = base_spread * self.config["UPTREND_SKEW"]  # UPTREND_SKEW < 1，降低卖出价差
-                    bid_spread = base_spread * (2 - self.config["UPTREND_SKEW"])  # 相应提高买入价差
-                else:  # 下降趋势
-                    # 在下降趋势中，提高卖出价差以控制风险，同时降低买入价差使其更容易成交
-                    ask_spread = base_spread * self.config["DOWNTREND_SKEW"]  # DOWNTREND_SKEW > 1，提高卖出价差
-                    bid_spread = base_spread * (2 - self.config["DOWNTREND_SKEW"])  # 相应降低买入价差
+                if current_price > sma:  # ขาขึ้น
+                    # ขาขึ้น: ลดสเปรดฝั่งขายให้ติดตลาดขึ้น และเพิ่มสเปรดฝั่งซื้อเพื่อคุมความเสี่ยง
+                    ask_spread = base_spread * self.config["UPTREND_SKEW"]  # < 1
+                    bid_spread = base_spread * (2 - self.config["UPTREND_SKEW"])  # รวมคงเดิม
+                else:  # ขาลง
+                    # ขาลง: เพิ่มสเปรดฝั่งขายเพื่อคุมความเสี่ยง และลดสเปรดฝั่งซื้อให้ติดตลาดขึ้น
+                    ask_spread = base_spread * self.config["DOWNTREND_SKEW"]  # > 1
+                    bid_spread = base_spread * (2 - self.config["DOWNTREND_SKEW"])  # รวมคงเดิม
             else:
                 ask_spread = bid_spread = base_spread
 
-            # 确保价差在配置的范围内
+            # บังคับให้อยู่ในช่วงที่ตั้งค่าไว้
             ask_spread = max(min(ask_spread, self.config["SPREAD_MAX"]), self.config["SPREAD_MIN"])
             bid_spread = max(min(bid_spread, self.config["SPREAD_MAX"]), self.config["SPREAD_MIN"])
 
-            # 记录最终价差用于调试
-            self.logger.debug(f"价差计算 - 基础价差: {base_spread:.4f}, " +
-                          f"最终卖出价差: {ask_spread:.4f}, 买入价差: {bid_spread:.4f}")
+            # บันทึกผลสุดท้ายเพื่อดีบัก
+            self.logger.debug(
+                f"คำนวณสเปรด - ฐาน: {base_spread:.4f}, "
+                + f"ขาย: {ask_spread:.4f}, ซื้อ: {bid_spread:.4f}"
+            )
 
             return ask_spread, bid_spread
 
         except Exception as e:
-            self.logger.error(f"计算动态价差失败: {str(e)}")
+            self.logger.error(f"คำนวณสเปรดแบบไดนามิกล้มเหลว: {str(e)}")
             return self.config["SPREAD"], self.config["SPREAD"]
 
     def _check_risk_control(self, current_price: float, position_cost: float) -> bool:
-        """检查风控条件"""
+        """ตรวจสอบเงื่อนไขความเสี่ยง (SL/TP)"""
         try:
             if position_cost <= 0:
                 return True
             
-            # 计算当前收益率
+            # ผลตอบแทนเมื่อเทียบทุน
             roi = (current_price - position_cost) / position_cost
             
-            # 检查止损条件
+            # เงื่อนไข Stop Loss
             if abs(roi) >= self.config["STOP_LOSS_ACTIVATION"]:
                 if roi < 0 and abs(roi) >= self.config["STOP_LOSS_RATIO"]:
-                    logger.warning(f"触发止损: ROI={roi:.2%}, 当前价格={current_price}, 持仓成本={position_cost}")
-                    # 市价卖出止损
+                    logger.warning(f"ทริกเกอร์ Stop Loss: ROI={roi:.2%}, ราคา={current_price}, ต้นทุน={position_cost}")
+                    # ปิดสถานะด้วย Market
                     self._close_position()
                     return False
             
-            # 检查止盈条件
+            # เงื่อนไข Take Profit
             if roi >= self.config["TAKE_PROFIT_RATIO"]:
-                logger.info(f"触发止盈: ROI={roi:.2%}, 当前价格={current_price}, 持仓成本={position_cost}")
-                # 市价卖出止盈
+                logger.info(f"ทริกเกอร์ Take Profit: ROI={roi:.2%}, ราคา={current_price}, ต้นทุน={position_cost}")
                 self._close_position()
                 return False
             
             return True
             
         except Exception as e:
-            logger.error(f"检查风控条件失败: {str(e)}")
+            logger.error(f"ตรวจสอบเงื่อนไขความเสี่ยงล้มเหลว: {str(e)}")
             return True
 
     def _close_position(self):
-        """市价平仓"""
+        """ปิดสถานะทั้งหมดด้วย Market"""
         try:
             position = self._get_cached_position()
             if position and position["size"] > 0:
@@ -436,179 +439,210 @@ class BollMakerBot:
                 }
                 order = self.rest_client.place_order(order_details)
                 if order and "id" in order:
-                    logger.info(f"市价平仓成功: 数量={position['size']}")
+                    logger.info(f"ปิดสถานะด้วย Market สำเร็จ: จำนวน={position['size']}")
                 
         except Exception as e:
-            logger.error(f"市价平仓失败: {str(e)}")
+            logger.error(f"ปิดสถานะด้วย Market ล้มเหลว: {str(e)}")
 
     def _adjust_orders(self, current_price: float, position_cost: float):
-        """根据当前价格和持仓成本调整订单"""
+        """ปรับคำสั่งซื้อขายตามราคาปัจจุบันและต้นทุนถือครอง"""
         try:
-            # 检查风控条件
+            # ตรวจความเสี่ยง
             if not self._check_risk_control(current_price, position_cost):
                 return
             
-            # 获取布林带数据的副本（最小化锁的持有时间）
+            # ดึงแบนด์อย่างปลอดภัยภายใต้ล็อก แล้วคำนวณนอกล็อก
             with self.boll_lock:
                 long_bands = self.long_boll.get_bands()
                 short_bands = self.short_boll.get_bands()
             
-            # 使用数据副本进行计算（不需要锁）
             long_upper, long_middle, long_lower = long_bands
             short_upper, short_middle, short_lower = short_bands
             
-            # 计算目标持仓比例
+            # คำนวณสเกลของสถานะเป้าหมาย (ยังคงใช้ได้ ถ้าจะปรับสูตรแจ้งได้)
             position_scale = self._calculate_position_scale(
                 current_price,
                 long_upper, long_lower,
                 short_upper, short_lower
             )
-            
-            # 取消现有订单
+
+            # --- เดิม: ยกเลิกทั้งหมด + วาง 1 ชั้น ---
+            # # PATCH: ยกเลิกคำสั่งเดิมทั้งหมด (คงไว้ก่อน เพื่อลดคำสั่งค้าง)
+            # self.rest_client.cancel_all_orders(self.symbol)
+            # self.current_orders = {}
+            # ... (วาง 1 buy / 1 sell) ...
+            # --- จบของเดิม ---
+
+            # PATCH: Multi-level Grid (หลายชั้น)
+            # ยกเลิกทั้งหมดก่อน เพื่อความง่าย/ชัดเจน (ถ้าต้องการ "reconcile รายคำสั่ง" แจ้งได้)
             self.rest_client.cancel_all_orders(self.symbol)
             self.current_orders = {}
-            
-            # 计算动态价差
-            ask_spread, bid_spread = self._calculate_dynamic_spread(current_price)
-            
-            # 计算买卖价格
-            buy_price = round(current_price * (1 - bid_spread), self.config["PRICE_PRECISION"])
-            sell_price = round(current_price * (1 + ask_spread), self.config["PRICE_PRECISION"])
-            
-            # 检查是否满足交易条件
+
+            levels = int(self.config.get("GRID_LEVELS_PER_SIDE", 6))
+            step = float(self.config.get("GRID_STEP", 0.006))  # 0.6% ต่อขั้น
+            price_prec = int(self.config["PRICE_PRECISION"])
+            qty_prec = int(self.config["QUANTITY_PRECISION"])
+
+            # เงื่อนไขเปิดออเดอร์ตาม band/SMA เดิม
             can_buy = True
             can_sell = True
-            
             if self.config["TRADE_IN_BAND"]:
                 can_buy = self.short_boll.is_price_in_band(current_price, short_upper, short_lower)
                 can_sell = self.short_boll.is_price_in_band(current_price, short_upper, short_lower)
-                
             if self.config["BUY_BELOW_SMA"]:
                 can_buy = can_buy and current_price < short_middle
-                
-            # 检查最小利润
+
+            # กำหนดงบต่อฝั่ง
+            side_ratio = float(self.config.get("GRID_SIDE_BUDGET_RATIO", 0.5))
+            total_budget = float(self.config.get("GRID_TOTAL_INVESTMENT", 200))
+            buy_usdc_cap = total_budget * side_ratio                  # กันงบฝั่งซื้อเป็น USDC
+            sell_base_cap = (total_budget * side_ratio) / current_price  # กันจำนวนหน่วย SOL ฝั่งขาย
+
+            # ขนาดคำสั่งพื้นฐาน (ต่อชั้น)
+            base_order_size = float(self.config["BASE_ORDER_SIZE"])   # หน่วยเป็น SOL
+            # หมายเหตุ: ถ้าอยากกำกับด้วย USDC ต่อชั้นแทน แจ้งได้ครับ จะสลับไปใช้ QUOTE_ORDER_SIZE
+
+            # ตัวนับงบที่ใช้จริง
+            used_buy_usdc = 0.0
+            used_sell_base = 0.0
+
+            # วนสร้างราคากริดหลายชั้น
+            # ฝั่งซื้อ: ต่ำกว่าราคากลาง 1*step, 2*step, ..., levels*step
+            # ฝั่งขาย: สูงกว่าราคากลาง 1*step, 2*step, ..., levels*step
+            buy_prices = []
+            sell_prices = []
+            for i in range(1, levels + 1):
+                bp = round(current_price * (1 - step * i), price_prec)
+                ap = round(current_price * (1 + step * i), price_prec)
+                # guard: ราคา > 0
+                if bp > 0:
+                    buy_prices.append(bp)
+                if ap > 0:
+                    sell_prices.append(ap)
+
+            # เงื่อนไขกำไรขั้นต่ำเทียบต้นทุน (สำหรับฝั่งขาย)
+            min_sell_price = None
             if position_cost > 0:
-                min_sell_price = round(position_cost * (1 + self.config["MIN_PROFIT_SPREAD"]), self.config["PRICE_PRECISION"])
-                can_sell = can_sell and sell_price > min_sell_price
-                
-            # 计算订单数量
-            base_order_size = self.config["BASE_ORDER_SIZE"]
-            quote_order_size = self.config["QUOTE_ORDER_SIZE"]
-            
-            # 根据持仓比例调整订单大小，添加最大订单限制
-            max_order_size = base_order_size * 5  # 最大订单限制为基础订单的5倍
-            buy_size = min(max(base_order_size * position_scale, base_order_size), max_order_size)
-            sell_size = min(max(base_order_size * (1 + (1 - position_scale)), base_order_size), max_order_size)
-            
-            # 格式化数量到指定精度（确保不超过3位小数）
-            precision = self.config["QUANTITY_PRECISION"]
-            buy_size = round(buy_size, precision)
-            sell_size = round(sell_size, precision)
-            
-            # 确保数量大于0
-            if buy_size <= 0 or sell_size <= 0:
-                logger.warning(f"订单数量异常: buy_size={buy_size}, sell_size={sell_size}, position_scale={position_scale}")
-                return
-            
-            # 下买单
+                min_sell_price = round(position_cost * (1 + self.config["MIN_PROFIT_SPREAD"]), price_prec)
+
+            # ส่งออเดอร์เป็นบันได
+            # ฝั่งซื้อ
             if can_buy:
-                try:
-                    order_details = {
-                        "symbol": self.symbol,
-                        "side": "Bid",
-                        "orderType": "Limit",
-                        "quantity": str(buy_size),
-                        "price": format(buy_price, f".{self.config['PRICE_PRECISION']}f"),
-                        "timeInForce": "GTC",
-                        "postOnly": True
-                    }
-                    order = self.rest_client.place_order(order_details)
-                    if order and "id" in order:
-                        self.current_orders[order["id"]] = order
-                        logger.info(f"下买单成功: 价格={buy_price}, 数量={buy_size}")
-                except Exception as e:
-                    logger.error(f"下买单失败: {str(e)}")
-                    
-            # 下卖单
+                for bp in buy_prices:
+                    notional = bp * base_order_size
+                    if used_buy_usdc + notional > buy_usdc_cap:
+                        break  # เกินงบฝั่งซื้อแล้วหยุด
+                    qty = round(base_order_size, qty_prec)
+                    if qty <= 0:
+                        continue
+                    try:
+                        order_details = {
+                            "symbol": self.symbol,
+                            "side": "Bid",
+                            "orderType": "Limit",
+                            "quantity": str(qty),
+                            "price": format(bp, f".{price_prec}f"),
+                            "timeInForce": "GTC",
+                            "postOnly": True
+                        }
+                        order = self.rest_client.place_order(order_details)
+                        if order and "id" in order:
+                            self.current_orders[order["id"]] = order
+                            used_buy_usdc += notional
+                            logger.info(f"ส่ง BUY ชั้นราคา {bp} จำนวน {qty} (ใช้ {used_buy_usdc:.2f}/{buy_usdc_cap:.2f} USDC)")
+                    except Exception as e:
+                        logger.error(f"ส่งออเดอร์ BUY@{bp} ล้มเหลว: {str(e)}")
+
+            # ฝั่งขาย
             if can_sell:
-                try:
-                    order_details = {
-                        "symbol": self.symbol,
-                        "side": "Ask",
-                        "orderType": "Limit",
-                        "quantity": str(sell_size),
-                        "price": format(sell_price, f".{self.config['PRICE_PRECISION']}f"),
-                        "timeInForce": "GTC",
-                        "postOnly": True
-                    }
-                    order = self.rest_client.place_order(order_details)
-                    if order and "id" in order:
-                        self.current_orders[order["id"]] = order
-                        logger.info(f"下卖单成功: 价格={sell_price}, 数量={sell_size}")
-                except Exception as e:
-                    logger.error(f"下卖单失败: {str(e)}")
-                    
+                for ap in sell_prices:
+                    # ถ้ามีต้นทุน ให้ขายเฉพาะที่มากกว่า min_sell_price
+                    if (min_sell_price is not None) and (ap <= min_sell_price):
+                        continue
+                    qty = round(base_order_size, qty_prec)
+                    if used_sell_base + qty > sell_base_cap:
+                        break  # เกินหน่วยสินทรัพย์ที่กันไว้แล้วหยุด
+                    if qty <= 0:
+                        continue
+                    try:
+                        order_details = {
+                            "symbol": self.symbol,
+                            "side": "Ask",
+                            "orderType": "Limit",
+                            "quantity": str(qty),
+                            "price": format(ap, f".{price_prec}f"),
+                            "timeInForce": "GTC",
+                            "postOnly": True
+                        }
+                        order = self.rest_client.place_order(order_details)
+                        if order and "id" in order:
+                            self.current_orders[order["id"]] = order
+                            used_sell_base += qty
+                            logger.info(f"ส่ง SELL ชั้นราคา {ap} จำนวน {qty} (ใช้ {used_sell_base:.4f}/{sell_base_cap:.4f} {self.symbol.split('_')[0]})")
+                    except Exception as e:
+                        logger.error(f"ส่งออเดอร์ SELL@{ap} ล้มเหลว: {str(e)}")
+
         except Exception as e:
-            logger.error(f"调整订单失败: {str(e)}")
+            logger.error(f"ปรับคำสั่งล้มเหลว (multi-grid): {str(e)}")
+
             
     def _calculate_position_scale(self, current_price: float,
                                 long_upper: float, long_lower: float,
                                 short_upper: float, short_lower: float) -> float:
-        """计算目标持仓比例"""
+        """คำนวณสเกลของสถานะเป้าหมาย"""
         try:
-            # 不需要加锁，因为使用的是数据副本
+            # ใช้สำเนาข้อมูล ไม่มีการล็อกที่นี่
             if not all([long_upper, long_lower, short_upper, short_lower]):
-                logger.warning("布林带数据未完全初始化，返回中性仓位")
+                logger.warning("ข้อมูล Bollinger ยังไม่พร้อมครบ ส่งค่ากลาง (1.0)")
                 return 1.0
 
-            # 检查分母是否为零或接近零
+            # ตรวจช่วงแบนด์ไม่ให้เล็กเกินไป
             long_range = long_upper - long_lower
             short_range = short_upper - short_lower
             
-            min_range = 0.0001  # 定义最小有效范围
+            min_range = 0.0001
             
             if long_range <= min_range or short_range <= min_range:
-                logger.warning("布林带范围过小，返回中性仓位")
+                logger.warning("ช่วงของ Bollinger แคบเกินไป ส่งค่ากลาง (1.0)")
                 return 1.0
             
-            # 计算价格在长期和短期布林带中的位置
+            # ตำแหน่งของราคาในแบนด์ระยะยาว/สั้น (0..1)
             long_position = (current_price - long_lower) / long_range
             short_position = (current_price - short_lower) / short_range
             
-            # 限制position值在[0,1]范围内
             long_position = max(0.0, min(1.0, long_position))
             short_position = max(0.0, min(1.0, short_position))
             
-            # 反转位置值（价格越低，仓位越大）
+            # กลับด้าน: ราคาต่ำ → ต้องการถือมาก
             long_position = 1.0 - long_position
             short_position = 1.0 - short_position
             
-            # 综合长期和短期指标
+            # เฉลี่ยระยะยาว/สั้น
             position_scale = (long_position + short_position) / 2
             
-            # 应用配置的仓位范围
+            # นำไปแมปเข้าช่วงที่กำหนดไว้
             min_scale = self.config["MIN_POSITION_SCALE"]
             max_scale = self.config["MAX_POSITION_SCALE"]
-            
-            # 将position_scale映射到配置的范围
             position_scale = min_scale + (max_scale - min_scale) * position_scale
             
-            logger.debug(f"计算仓位比例 - 当前价格: {current_price}, 长期位置: {long_position:.4f}, " +
-                      f"短期位置: {short_position:.4f}, 最终比例: {position_scale:.4f}")
+            logger.debug(
+                f"คำนวณสัดส่วนถือครอง - ราคา: {current_price}, ระยะยาว: {long_position:.4f}, "
+                + f"ระยะสั้น: {short_position:.4f}, สุดท้าย: {position_scale:.4f}"
+            )
             
             return position_scale
                 
         except Exception as e:
-            logger.error(f"计算持仓比例失败: {str(e)}")
-            return 1.0  # 发生错误时返回中性仓位
+            logger.error(f"คำนวณสัดส่วนถือครองล้มเหลว: {str(e)}")
+            return 1.0
             
     def subscribe_order_updates(self):
-        """订阅订单更新流"""
+        """สมัครรับสตรีมอัปเดตคำสั่งซื้อขาย (private stream)"""
         if not self.ws_client or not self.ws_client.is_connected():
-            logger.warning("无法订阅订单更新：WebSocket连接不可用")
+            logger.warning("ไม่สามารถสมัครรับอัปเดตคำสั่งได้: การเชื่อมต่อ WebSocket ไม่พร้อม")
             return False
         
-        # 尝试订阅订单更新流
+        # พยายามสมัครรับอัปเดต
         stream = f"account.orderUpdate.{self.symbol}"
         if stream not in self.ws_client.subscriptions:
             retry_count = 0
@@ -619,28 +653,28 @@ class BollMakerBot:
                 try:
                     success = self.ws_client.private_subscribe(stream)
                     if success:
-                        logger.info(f"成功订阅订单更新: {stream}")
+                        logger.info(f"สมัครรับอัปเดตคำสั่งสำเร็จ: {stream}")
                         return True
                     else:
-                        logger.warning(f"订阅订单更新失败，尝试重试... ({retry_count+1}/{max_retries})")
+                        logger.warning(f"สมัครรับอัปเดตคำสั่งไม่สำเร็จ กำลังลองใหม่... ({retry_count+1}/{max_retries})")
                 except Exception as e:
-                    logger.error(f"订阅订单更新时发生异常: {e}")
+                    logger.error(f"เกิดข้อยกเว้นระหว่างสมัครรับอัปเดตคำสั่ง: {e}")
                 
                 retry_count += 1
                 if retry_count < max_retries:
-                    time.sleep(1)  # 重试前等待
+                    time.sleep(1)  # หน่วงก่อนลองใหม่
             
             if not success:
-                logger.error(f"在 {max_retries} 次尝试后仍无法订阅订单更新")
+                logger.error(f"พยายาม {max_retries} ครั้งแล้วยังสมัครรับอัปเดตคำสั่งไม่สำเร็จ")
                 return False
         else:
-            logger.info(f"已经订阅了订单更新: {stream}")
+            logger.info(f"สมัครรับอัปเดตคำสั่งไว้แล้ว: {stream}")
             return True
 
     def _update_kline_data(self):
-        """更新K线数据并计算布林带"""
+        """ดึง/อัปเดตข้อมูล Kline และคำนวณ Bollinger"""
         try:
-            # 获取K线数据（不需要锁）
+            # ดึง Kline (ไม่ต้องล็อก)
             long_klines = self.rest_client.get_klines(
                 self.symbol,
                 interval=self.config["LONG_BOLL_INTERVAL"],
@@ -653,36 +687,37 @@ class BollMakerBot:
                 limit=self.config["SHORT_BOLL_PERIOD"] * 2
             )
             
-            # 检查K线数据
+            # ตรวจสอบข้อมูล
             if not long_klines or not short_klines:
-                logger.error(f"获取K线数据失败 - 长周期: {len(long_klines) if long_klines else 0} 根, " +
-                           f"短周期: {len(short_klines) if short_klines else 0} 根")
+                logger.error(
+                    f"ดึง Kline ไม่สำเร็จ - ระยะยาว: {len(long_klines) if long_klines else 0} แท่ง, "
+                    + f"ระยะสั้น: {len(short_klines) if short_klines else 0} แท่ง"
+                )
                 return
                 
-            # 记录原始数据格式以便调试
-            logger.debug(f"长周期K线数据格式: {type(long_klines)}, 数据: {long_klines[:1]}")
-            logger.debug(f"短周期K线数据格式: {type(short_klines)}, 数据: {short_klines[:1]}")
+            # บันทึกตัวอย่างรูปแบบข้อมูลเพื่อดีบัก
+            logger.debug(f"ตัวอย่าง Kline ระยะยาว: {type(long_klines)}, ตัวอย่าง: {long_klines[:1]}")
+            logger.debug(f"ตัวอย่าง Kline ระยะสั้น: {type(short_klines)}, ตัวอย่าง: {short_klines[:1]}")
                 
-            # 准备数据（不需要锁）
+            # เตรียมข้อมูล
             if long_klines:
                 try:
-                    # 确保数据是列表格式
                     if isinstance(long_klines, dict):
                         long_klines = [long_klines]
                     
-                    # 按开始时间排序
+                    # เรียงตามเวลาเริ่มต้น
                     sorted_long_klines = sorted(long_klines, key=lambda x: x['start'] if isinstance(x, dict) else x[0])
                     recent_long_klines = sorted_long_klines[-self.config["LONG_BOLL_PERIOD"]:]
                     
-                    # 获取收盘价
+                    # ดึงราคาปิด
                     long_closes = []
                     for k in recent_long_klines:
                         if isinstance(k, dict):
                             long_closes.append(float(k['close']))
                         else:
-                            long_closes.append(float(k[4]))  # 第4个元素是收盘价
+                            long_closes.append(float(k[4]))  # index 4 = close
                     
-                    # 更新长周期布林带
+                    # อัปเดต Bollinger ระยะยาว
                     with self.boll_lock:
                         self.long_boll = BollingerBands(
                             period=self.config["LONG_BOLL_PERIOD"],
@@ -691,29 +726,25 @@ class BollMakerBot:
                         for price in long_closes:
                             self.long_boll.update(price)
                         
-                    logger.debug(f"更新长周期布林带 - 使用 {len(long_closes)} 根K线")
+                    logger.debug(f"อัปเดต Bollinger ระยะยาวด้วย {len(long_closes)} แท่ง")
                 except Exception as e:
-                    logger.error(f"处理长周期K线数据时出错: {str(e)}")
+                    logger.error(f"ประมวลผล Kline ระยะยาวล้มเหลว: {str(e)}")
             
             if short_klines:
                 try:
-                    # 确保数据是列表格式
                     if isinstance(short_klines, dict):
                         short_klines = [short_klines]
                     
-                    # 按开始时间排序
                     sorted_short_klines = sorted(short_klines, key=lambda x: x['start'] if isinstance(x, dict) else x[0])
                     recent_short_klines = sorted_short_klines[-self.config["SHORT_BOLL_PERIOD"]:]
                     
-                    # 获取收盘价
                     short_closes = []
                     for k in recent_short_klines:
                         if isinstance(k, dict):
                             short_closes.append(float(k['close']))
                         else:
-                            short_closes.append(float(k[4]))  # 第4个元素是收盘价
+                            short_closes.append(float(k[4]))
                     
-                    # 更新短周期布林带
                     with self.boll_lock:
                         self.short_boll = BollingerBands(
                             period=self.config["SHORT_BOLL_PERIOD"],
@@ -722,16 +753,15 @@ class BollMakerBot:
                         for price in short_closes:
                             self.short_boll.update(price)
                         
-                    logger.debug(f"更新短周期布林带 - 使用 {len(short_closes)} 根K线")
+                    logger.debug(f"อัปเดต Bollinger ระยะสั้นด้วย {len(short_closes)} แท่ง")
                 except Exception as e:
-                    logger.error(f"处理短周期K线数据时出错: {str(e)}")
+                    logger.error(f"ประมวลผล Kline ระยะสั้นล้มเหลว: {str(e)}")
             
-            # 更新最新价格（不需要锁，允许竞争）
+            # อัปเดตราคาล่าสุดจาก Kline ล่าสุด
             if short_klines and len(short_klines) > 0:
                 latest_kline = short_klines[-1]
                 try:
                     if isinstance(latest_kline, dict):
-                        # 将时间字符串转换为时间戳
                         latest_time = datetime.strptime(latest_kline['end'], '%Y-%m-%d %H:%M:%S').timestamp()
                         latest_price = float(latest_kline['close'])
                     else:
@@ -741,37 +771,38 @@ class BollMakerBot:
                     if latest_time > self.last_update_time:
                         self.last_price = latest_price
                         self.last_update_time = latest_time
-                        logger.debug(f"从K线更新最新价格: {self.last_price}")
+                        logger.debug(f"อัปเดตราคาล่าสุดจาก Kline: {self.last_price}")
                 except Exception as e:
-                    logger.error(f"更新最新价格时出错: {str(e)}")
+                    logger.error(f"อัปเดตราคาล่าสุดล้มเหลว: {str(e)}")
                     if not isinstance(e, str):
                         import traceback
-                        logger.error(f"详细错误信息: {traceback.format_exc()}")
+                        logger.error(f"รายละเอียดข้อผิดพลาด: {traceback.format_exc()}")
             
-            # 标记初始化完成
+            # ทำเครื่องหมายว่าเตรียมข้อมูลเรียบร้อยแล้ว
             if not self.init_complete.is_set():
-                # 使用 is_ready 方法检查布林带是否准备就绪
                 with self.boll_lock:
                     long_ready = self.long_boll.is_ready()
                     short_ready = self.short_boll.is_ready()
                 
                 if long_ready and short_ready:
                     self.init_complete.set()
-                    logger.info("K线数据初始化完成")
+                    logger.info("เตรียมข้อมูล Kline เรียบร้อย")
                 else:
-                    logger.debug(f"布林带数据尚未准备就绪 - 长周期: {len(self.long_boll.prices)}/{self.config['LONG_BOLL_PERIOD']}, " +
-                               f"短周期: {len(self.short_boll.prices)}/{self.config['SHORT_BOLL_PERIOD']}")
+                    logger.debug(
+                        f"ข้อมูล Bollinger ยังไม่พร้อม - ระยะยาว: {len(self.long_boll.prices)}/{self.config['LONG_BOLL_PERIOD']}, "
+                        + f"ระยะสั้น: {len(self.short_boll.prices)}/{self.config['SHORT_BOLL_PERIOD']}"
+                    )
                 
         except Exception as e:
-            logger.error(f"更新K线数据失败: {str(e)}")
+            logger.error(f"อัปเดต Kline ล้มเหลว: {str(e)}")
             if not isinstance(e, str):
                 import traceback
-                logger.error(f"详细错误信息: {traceback.format_exc()}")
+                logger.error(f"รายละเอียดข้อผิดพลาด: {traceback.format_exc()}")
 
     def _initialize_websocket(self):
-        """等待WebSocket连接建立并进行初始化订阅"""
+        """รอให้ WebSocket เชื่อมต่อ และสมัครรับสตรีมที่จำเป็น"""
         wait_time = 0
-        max_wait_time = 30  # 增加等待时间到30秒
+        max_wait_time = 30  # เพิ่มเพดานเวลารอเป็น 30 วินาที
         retry_count = 0
         max_retries = 3
         
@@ -783,209 +814,208 @@ class BollMakerBot:
                     wait_time += 1
                     
                 if self.ws_client.connected:
-                    logger.info("WebSocket连接已建立，初始化数据流...")
+                    logger.info("เชื่อมต่อ WebSocket แล้ว กำลังเริ่มสตรีมข้อมูล...")
                     
-                    # 初始化订单簿
+                    # สร้างสแน็ปช็อตของออเดอร์บุ๊ก
                     orderbook_initialized = self.ws_client.initialize_orderbook()
                     
-                    # 订阅深度流和行情数据
+                    # สมัครรับ depth และ bookTicker
                     if orderbook_initialized:
                         depth_subscribed = self.ws_client.subscribe_depth()
                         ticker_subscribed = self.ws_client.subscribe_bookTicker()
                         
                         if depth_subscribed and ticker_subscribed:
-                            logger.info("行情数据流订阅成功!")
+                            logger.info("สมัครรับสตรีมตลาดสำเร็จ!")
                             
-                        # 订阅私有订单更新流
+                        # สมัครรับสตรีมคำสั่งส่วนตัว
                         if self.subscribe_order_updates():
-                            logger.info("订单更新流订阅成功!")
-                            return True  # 所有初始化成功
+                            logger.info("สมัครรับสตรีมอัปเดตคำสั่งสำเร็จ!")
+                            return True
                         else:
-                            logger.error("订单更新流订阅失败")
+                            logger.error("สมัครรับสตรีมอัปเดตคำสั่งไม่สำเร็จ")
                     else:
-                        logger.error("订单簿初始化失败")
+                        logger.error("สร้างสแน็ปช็อตออเดอร์บุ๊กไม่สำเร็จ")
                 
                 retry_count += 1
                 if retry_count < max_retries:
-                    logger.warning(f"WebSocket初始化失败，正在进行第{retry_count + 1}次重试...")
+                    logger.warning(f"การตั้งค่า WebSocket ล้มเหลว กำลังลองครั้งที่ {retry_count + 1}...")
                     self.ws_client.reconnect()
-                    time.sleep(5)  # 重试前等待5秒
+                    time.sleep(5)
                     
             except Exception as e:
-                logger.error(f"WebSocket初始化发生错误: {str(e)}")
+                logger.error(f"เกิดข้อผิดพลาดระหว่างตั้งค่า WebSocket: {str(e)}")
                 retry_count += 1
                 if retry_count < max_retries:
                     time.sleep(5)
                     
-        logger.error(f"在{max_retries}次尝试后WebSocket初始化仍然失败")
+        logger.error(f"ลอง {max_retries} ครั้งแล้วยังตั้งค่า WebSocket ไม่สำเร็จ")
         return False
 
     def _check_and_reconnect_ws(self):
-        """检查WebSocket连接状态并在需要时重连"""
+        """ตรวจสอบสถานะ WebSocket และเชื่อมต่อใหม่เมื่อจำเป็น"""
         if not self.ws_client.connected:
-            logger.warning("检测到WebSocket连接断开，尝试重新连接...")
+            logger.warning("ตรวจพบว่า WebSocket หลุด กำลังพยายามเชื่อมต่อใหม่...")
             retry_count = 0
             max_retries = 3
             
             while retry_count < max_retries and not self.ws_client.connected:
                 try:
                     self.ws_client.reconnect()
-                    time.sleep(2)  # 等待连接建立
+                    time.sleep(2)
                     
                     if self.ws_client.connected:
                         success = self._initialize_websocket()
                         if success:
-                            logger.info("WebSocket重连成功并完成初始化")
+                            logger.info("เชื่อมต่อ WebSocket ใหม่สำเร็จพร้อมตั้งค่าสตรีม")
                             return True
                             
                 except Exception as e:
-                    logger.error(f"WebSocket重连尝试失败: {str(e)}")
+                    logger.error(f"ความพยายามเชื่อมต่อ WebSocket ใหม่ล้มเหลว: {str(e)}")
                     
                 retry_count += 1
                 if retry_count < max_retries:
-                    wait_time = 5 * (retry_count + 1)  # 递增等待时间
-                    logger.info(f"等待{wait_time}秒后进行第{retry_count + 1}次重试...")
+                    wait_time = 5 * (retry_count + 1)
+                    logger.info(f"รอ {wait_time} วินาที ก่อนลองครั้งที่ {retry_count + 1}...")
                     time.sleep(wait_time)
             
             if not self.ws_client.connected:
-                logger.error("WebSocket重连失败，将在下一个检查周期重试")
+                logger.error("เชื่อมต่อ WebSocket ใหม่ไม่สำเร็จ จะลองอีกครั้งในรอบถัดไป")
                 return False
                 
         return True
 
     def _kline_update_worker(self):
-        """K线数据更新工作线程"""
-        logger.info("K线更新线程已启动")
+        """เธรดทำงานอัปเดต Kline"""
+        logger.info("เริ่มเธรดอัปเดต Kline")
         while self.running:
             try:
                 self._update_kline_data()
                 time.sleep(self.kline_update_interval)
             except Exception as e:
-                logger.error(f"K线更新线程发生错误: {str(e)}")
-                time.sleep(5)  # 发生错误时等待较短时间后继续
+                logger.error(f"เธรดอัปเดต Kline เกิดข้อผิดพลาด: {str(e)}")
+                time.sleep(5)
 
     def start(self):
-        """启动交易机器人"""
+        """เริ่มหุ่นยนต์เทรด"""
         try:
             self.running = True
             
-            # 连接WebSocket并初始化数据流
+            # เชื่อมต่อ WebSocket และตั้งค่าสตรีม
             self.ws_client.connect()
             if not self._initialize_websocket():
-                logger.error("WebSocket初始化失败，无法启动机器人")
+                logger.error("ตั้งค่า WebSocket ไม่สำเร็จ ไม่สามารถเริ่มหุ่นยนต์ได้")
                 self.stop()
                 return
             
-            # 启动K线更新线程
+            # สตาร์ทเธรดอัปเดต Kline
             self.kline_update_thread = threading.Thread(
                 target=self._kline_update_worker,
                 daemon=True
             )
             self.kline_update_thread.start()
             
-            # 等待初始化完成
+            # รอข้อมูลพร้อม
             if not self.init_complete.wait(timeout=30):
-                logger.error("K线数据初始化超时")
+                logger.error("เตรียมข้อมูล Kline เกินเวลา")
                 self.stop()
                 return
             
-            logger.info("交易机器人已启动")
+            logger.info("หุ่นยนต์เทรดเริ่มทำงานแล้ว")
             
             last_ws_check = time.time()
-            ws_check_interval = 30  # 每30秒检查一次WebSocket状态
+            ws_check_interval = 30  # ตรวจเช็ค WebSocket ทุก 30 วินาที
             
-            # 主循环
+            # ลูปหลัก
             while self.running:
                 try:
                     current_time = time.time()
                     
-                    # 处理数据库操作队列
+                    # ประมวลผลงานฐานข้อมูล
                     self._process_db_queue()
                     
-                    # 定期检查WebSocket连接状态
+                    # ตรวจสอบ WebSocket เป็นระยะ
                     if current_time - last_ws_check >= ws_check_interval:
                         if not self._check_and_reconnect_ws():
-                            # 如果重连失败，增加检查间隔以避免过于频繁的重试
-                            ws_check_interval = min(ws_check_interval * 2, 300)  # 最大间隔5分钟
+                            ws_check_interval = min(ws_check_interval * 2, 300)
                         else:
-                            ws_check_interval = 30  # 重置为正常间隔
+                            ws_check_interval = 30
                         last_ws_check = current_time
                     
-                    time.sleep(0.1)  # 控制循环频率
+                    time.sleep(0.1)
                     
                 except KeyboardInterrupt:
-                    logger.info("收到退出信号，正在停止机器人...")
+                    logger.info("ได้รับสัญญาณหยุด กำลังปิดหุ่นยนต์...")
                     self.stop()
                     break
                 except Exception as e:
-                    logger.error(f"主循环发生错误: {str(e)}")
-                    time.sleep(5)  # 发生错误时等待一段时间再继续
+                    logger.error(f"ลูปหลักเกิดข้อผิดพลาด: {str(e)}")
+                    time.sleep(5)
                     
         except Exception as e:
-            logger.error(f"启动失败: {str(e)}")
+            logger.error(f"เริ่มทำงานล้มเหลว: {str(e)}")
             self.stop()
 
     def stop(self):
-        """停止交易机器人"""
+        """หยุดหุ่นยนต์เทรด"""
         try:
             self.running = False
             
-            # 等待K线更新线程结束
+            # รอเธรด Kline จบ
             if self.kline_update_thread and self.kline_update_thread.is_alive():
                 try:
                     self.kline_update_thread.join(timeout=5)
                 except Exception as e:
-                    logger.error(f"等待K线更新线程结束时发生错误: {str(e)}")
+                    logger.error(f"เกิดข้อผิดพลาดขณะรอเธรด Kline: {str(e)}")
             
-            # 取消所有订单
+            # ยกเลิกคำสั่งทั้งหมด
             self.rest_client.cancel_all_orders(self.symbol)
             
-            # 关闭WebSocket连接
+            # ปิด WebSocket
             if self.ws_client:
                 self.ws_client.close()
             
-            logger.info("交易机器人已停止")
+            logger.info("หยุดหุ่นยนต์เทรดเรียบร้อย")
         except Exception as e:
-            logger.error(f"停止失败: {str(e)}")
+            logger.error(f"หยุดทำงานล้มเหลว: {str(e)}")
 
     def __del__(self):
-        """清理资源"""
+        """คืนทรัพยากร"""
         if hasattr(self, 'db'):
             self.db.close()
 
     def _calculate_total_balance(self, include_borrow_positions=True) -> Tuple[float, float, float, Optional[str]]:
         """
-        计算账户总余额，包括现货和借贷仓位
+        คำนวณมูลค่ารวมของพอร์ต รวม Spot และสถานะกู้ยืม (ถ้ามี)
 
         Args:
-            include_borrow_positions (bool): 是否包含借贷仓位，默认为True
+            include_borrow_positions (bool): รวมสถานะกู้ยืมหรือไม่ (ค่าเริ่มต้น True)
 
         Returns:
             Tuple[float, float, float, Optional[str]]: 
-                - base_balance (float): 基础货币余额（包括现货和借贷）
-                - quote_balance (float): 报价货币余额（包括现货和借贷）
-                - total_value_in_quote (float): 总资产价值（以报价货币计算）
-                - error_message (Optional[str]): 错误信息，如果没有错误则为None
+                - base_balance: ยอดคงเหลือของสินทรัพย์ฐาน (รวม Spot+กู้ยืม)
+                - quote_balance: ยอดคงเหลือของสินทรัพย์อ้างอิง (รวม Spot+กู้ยืม)
+                - total_value_in_quote: มูลค่ารวมคิดเป็นสกุลอ้างอิง
+                - error_message: ข้อความผิดพลาด (None ถ้าไม่มี)
         """
         try:
-            # 获取现货余额
+            # ดึงยอดคงเหลือ Spot
             balances = self.rest_client.get_balance()
-            logger.info(f"API返回的余额数据: {balances}")  # 添加日志查看数据格式
+            logger.info(f"ข้อมูลยอดคงเหลือจาก API: {balances}")
             
-            # 检查返回的数据是否有错误
+            # ตรวจข้อผิดพลาดจาก API
             if isinstance(balances, dict) and "error" in balances:
-                error_msg = f"获取余额API返回错误: {balances['error']}"
+                error_msg = f"API ยอดคงเหลือส่งข้อผิดพลาด: {balances['error']}"
                 logger.error(error_msg)
                 return 0.0, 0.0, 0.0, error_msg
             
-            # 从交易对中获取基础货币和计价货币
+            # แยกสกุล Base/Quote จากสัญลักษณ์
             base_currency, quote_currency = self.symbol.split('_')
             
-            # 初始化现货余额
+            # ยอด Spot เริ่มต้น
             spot_base_balance = 0
             spot_quote_balance = 0
             
-            # 计算现货总余额（可用 + 锁定）
+            # รวมยอด (available + locked)
             if isinstance(balances, dict):
                 for asset, details in balances.items():
                     if isinstance(details, dict):
@@ -998,15 +1028,14 @@ class BollMakerBot:
                         elif asset == quote_currency:
                             spot_quote_balance = total
                     else:
-                        logger.warning(f"资产 {asset} 的余额数据格式不正确: {details}")
+                        logger.warning(f"รูปแบบข้อมูลยอดของสินทรัพย์ {asset} ไม่ถูกต้อง: {details}")
             else:
-                logger.warning(f"余额数据格式不正确: {balances}")
+                logger.warning(f"รูปแบบข้อมูลยอดคงเหลือไม่ถูกต้อง: {balances}")
             
-            # 初始化借贷调整
+            # ปรับด้วยสถานะกู้ยืม (ถ้าต้องการ)
             borrow_lend_base_adjustment = 0
             borrow_lend_quote_adjustment = 0
             
-            # 获取并处理借贷仓位
             if include_borrow_positions:
                 try:
                     borrow_positions = self.rest_client.get_borrow_lend_positions()
@@ -1020,45 +1049,52 @@ class BollMakerBot:
                                     net_quantity = float(net_quantity_str)
                                     if position_symbol == base_currency:
                                         borrow_lend_base_adjustment = net_quantity
-                                        logger.debug(f"借贷调整 - 基础资产 ({base_currency}): {net_quantity}")
+                                        logger.debug(f"ปรับด้วยกู้ยืม - สินทรัพย์ฐาน ({base_currency}): {net_quantity}")
                                     elif position_symbol == quote_currency:
                                         borrow_lend_quote_adjustment = net_quantity
-                                        logger.debug(f"借贷调整 - 报价资产 ({quote_currency}): {net_quantity}")
+                                        logger.debug(f"ปรับด้วยกู้ยืม - สินทรัพย์อ้างอิง ({quote_currency}): {net_quantity}")
                                 except ValueError as e:
-                                    logger.error(f"处理借贷仓位数据时出错 ({position_symbol}): {e}")
+                                    logger.error(f"ประมวลผลข้อมูลกู้ยืมล้มเหลว ({position_symbol}): {e}")
                                     continue
                 except Exception as e:
-                    logger.warning(f"获取借贷仓位失败: {str(e)}")
-                    # 继续执行，但不包括借贷仓位
+                    logger.warning(f"ดึงสถานะกู้ยืมไม่สำเร็จ: {str(e)}")
+                    # ดำเนินต่อโดยไม่รวมกู้ยืม
             
-            # 计算最终余额（现货余额 + 借贷调整）
+            # รวมยอดสุดท้าย (Spot + ปรับด้วยกู้ยืม)
             base_balance = spot_base_balance + borrow_lend_base_adjustment
             quote_balance = spot_quote_balance + borrow_lend_quote_adjustment
             
-            # 获取当前价格用于计算总价值
-            current_price = self.last_price  # 使用最新价格
+            # ประเมินมูลค่ารวมด้วยราคาล่าสุด
+            current_price = self.last_price
             if not current_price:
-                logger.warning("无法获取当前价格，总资产价值可能不准确")
-                total_value_in_quote = quote_balance  # 假设基础资产价值为0
+                logger.warning("ไม่พบราคาปัจจุบัน ค่ามูลค่ารวมอาจคลาดเคลื่อน")
+                total_value_in_quote = quote_balance
             else:
                 total_value_in_quote = (base_balance * current_price) + quote_balance
             
-            logger.info(f"计算后余额 - 基础({base_currency}): {base_balance:.8f} (现货: {spot_base_balance:.8f}, 借贷: {borrow_lend_base_adjustment:.8f})")
-            logger.info(f"计算后余额 - 报价({quote_currency}): {quote_balance:.8f} (现货: {spot_quote_balance:.8f}, 借贷: {borrow_lend_quote_adjustment:.8f})")
-            logger.info(f"计算后总价值: {total_value_in_quote:.8f} {quote_currency}")
+            logger.info(
+                f"หลังคำนวณยอด - ฐาน({base_currency}): {base_balance:.8f} (Spot: {spot_base_balance:.8f}, กู้ยืม: {borrow_lend_base_adjustment:.8f})"
+            )
+            logger.info(
+                f"หลังคำนวณยอด - อ้างอิง({quote_currency}): {quote_balance:.8f} (Spot: {spot_quote_balance:.8f}, กู้ยืม: {borrow_lend_quote_adjustment:.8f})"
+            )
+            logger.info(f"มูลค่ารวม: {total_value_in_quote:.8f} {quote_currency}")
             
             return base_balance, quote_balance, total_value_in_quote, None
             
         except Exception as e:
-            error_msg = f"计算总余额时发生错误: {str(e)}"
+            error_msg = f"คำนวณมูลค่ารวมล้มเหลว: {str(e)}"
             logger.error(error_msg)
             import traceback
             traceback.print_exc()
             return 0.0, 0.0, 0.0, error_msg
 
 if __name__ == "__main__":
-    # 构建配置字典
+    # สร้างดิกชันนารีคอนฟิก
     config = {
+        "GRID_LEVELS_PER_SIDE": GRID_LEVELS_PER_SIDE,
+        "GRID_STEP": GRID_STEP,
+        "GRID_SIDE_BUDGET_RATIO": GRID_SIDE_BUDGET_RATIO,
         "API_KEY": API_KEY,
         "SECRET_KEY": SECRET_KEY,
         "SYMBOL": SYMBOL,
@@ -1093,34 +1129,34 @@ if __name__ == "__main__":
     
     bot = None
     try:
-        # 初始化并启动机器人
+        # เริ่มและทำงาน
         bot = BollMakerBot(config)
         bot.start()
         
-        # 主循环，保持程序运行
+        # ลูปหลักเพื่อคงโปรเซสไว้
         while bot.running:
             try:
                 time.sleep(1)
                 
-                # 检查WebSocket连接状态
+                # ถ้า WS หลุด พยายามเชื่อมใหม่
                 if bot.running and not bot.ws_client.connected:
-                    logger.warning("WebSocket连接断开，尝试重新连接...")
+                    logger.warning("WebSocket หลุด กำลังเชื่อมต่อใหม่...")
                     bot.ws_client.reconnect()
                     
             except KeyboardInterrupt:
-                logger.info("收到退出信号，正在停止机器人...")
+                logger.info("ได้รับสัญญาณหยุด กำลังปิดหุ่นยนต์...")
                 if bot:
                     bot.stop()
                 break
             except Exception as e:
-                logger.error(f"主循环发生错误: {str(e)}")
-                time.sleep(5)  # 发生错误时等待一段时间再继续
+                logger.error(f"ลูปหลักเกิดข้อผิดพลาด: {str(e)}")
+                time.sleep(5)
                 
     except KeyboardInterrupt:
-        logger.info("程序被用户中断")
+        logger.info("ผู้ใช้ยกเลิกการทำงาน")
     except Exception as e:
-        logger.error(f"程序发生错误: {str(e)}")
+        logger.error(f"โปรแกรมเกิดข้อผิดพลาด: {str(e)}")
     finally:
         if bot:
             bot.stop()
-        logger.info("程序已退出") 
+        logger.info("โปรแกรมสิ้นสุดการทำงาน")

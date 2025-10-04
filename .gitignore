@@ -1,21 +1,14 @@
-# Python-generated files
+# Python
 __pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-.python-version
-
-# Virtual environments
-.venv
-
-# Environment variables
+*.pyc
+*.pyo
+*.pyd
 .env
-
-# Data files
-data/
-*.db
-# Logs
-logs/
-
+.venv/
+venv/
+.env.*
+# VS Code
+.vscode/
+# OS junk
+.DS_Store
+Thumbs.db
